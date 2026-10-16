@@ -77,9 +77,9 @@ def client_ip(request: Request) -> str:
     return host or "unknown"
 
 
-def auth_key(scope: str, request: Request, phone: str) -> str:
-    """Ключ лимита для эндпоинтов аутентификации: IP + телефон."""
-    return f"{scope}:{client_ip(request)}:{phone.strip()}"
+def auth_key(scope: str, request: Request, identifier: str) -> str:
+    """Ключ лимита для эндпоинтов аутентификации: IP + username."""
+    return f"{scope}:{client_ip(request)}:{identifier.strip().lower()}"
 
 
 def user_key(scope: str, request: Request, user_id: int) -> str:

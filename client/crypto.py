@@ -104,19 +104,19 @@ def _vault_save(data: dict) -> None:
     ct = AESGCM(_device_key()).encrypt(nonce, plain, None)
     VAULT_FILE.write_bytes(nonce + ct)
 
-def vault_save_token(phone: str, token: str) -> None:
+def vault_save_token(username: str, token: str) -> None:
     """Сохраняет токен авторизации в изолированном хранилище."""
     data = _vault_load()
-    data.setdefault("tokens", {})[phone] = token
+    data.setdefault("tokens", {})[username] = token
     _vault_save(data)
 
-def vault_load_token(phone: str) -> Optional[str]:
+def vault_load_token(username: str) -> Optional[str]:
     """Возвращает сохранённый токен по номеру телефона (или None)."""
-    return _vault_load().get("tokens", {}).get(phone)
+    return _vault_load().get("tokens", {}).get(username)
 
-def vault_remove_token(phone: str) -> None:
+def vault_remove_token(username: str) -> None:
     data = _vault_load()
-    data.get("tokens", {}).pop(phone, None)
+    data.get("tokens", {}).pop(username, None)
     _vault_save(data)
 
 def vault_clear() -> None:

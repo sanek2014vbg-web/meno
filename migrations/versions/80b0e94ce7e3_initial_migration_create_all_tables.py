@@ -28,7 +28,8 @@ def upgrade() -> None:
     )
     op.create_table('users',
     sa.Column('id', sa.Integer(), autoincrement=True, nullable=False),
-    sa.Column('phone', sa.String(), nullable=False),
+    sa.Column('username', sa.String(length=32), nullable=True),
+    sa.Column('phone', sa.String(), nullable=True),
     sa.Column('password_hash', sa.String(), nullable=False),
     sa.Column('display_name', sa.String(), server_default='', nullable=True),
     sa.Column('role', sa.String(), server_default='user', nullable=True),
@@ -39,11 +40,13 @@ def upgrade() -> None:
     sa.Column('created_at', sa.DateTime(), server_default=sa.text('(CURRENT_TIMESTAMP)'), nullable=True),
     sa.Column('last_seen', sa.DateTime(), nullable=True),
     sa.PrimaryKeyConstraint('id'),
-    sa.UniqueConstraint('phone')
+    sa.UniqueConstraint('phone'),
+    sa.UniqueConstraint('username')
     )
     op.create_table('verify_codes',
     sa.Column('id', sa.Integer(), autoincrement=True, nullable=False),
-    sa.Column('phone', sa.String(), nullable=False),
+    sa.Column('target', sa.String(), nullable=True),
+    sa.Column('phone', sa.String(), nullable=True),
     sa.Column('code', sa.String(), nullable=False),
     sa.Column('purpose', sa.String(), server_default='register', nullable=True),
     sa.Column('expires_at', sa.DateTime(), nullable=False),

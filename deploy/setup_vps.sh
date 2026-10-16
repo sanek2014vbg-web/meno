@@ -8,7 +8,7 @@
 #   ./setup_vps.sh --https    # дополнительно: nginx + HTTPS (Let's Encrypt)
 #
 # Перед запуском отредактируйте переменные ниже:
-#   ADMIN_PHONE  — номер владельца (получит роль admin и DevMode)
+#   ADMIN_USERNAME — username владельца (получит роль admin и DevMode)
 #   JWT_SECRET   — длинная случайная строка (пароли/токены)
 #   DOMAIN       — домен для HTTPS (например meno.example.com)
 # ============================================================
@@ -20,7 +20,7 @@ VENV_DIR="$APP_DIR/.venv"
 SERVICE_USER="meno"
 
 # ---- Переменные для редактирования -------------------------
-ADMIN_PHONE="${ADMIN_PHONE:-79990000001}"
+ADMIN_USERNAME="${ADMIN_USERNAME:-owner}"
 JWT_SECRET="${JWT_SECRET:-$(openssl rand -hex 32)}"
 DOMAIN="${DOMAIN:-}"          # например "meno.example.com" для --https
 HTTPS_MODE="${1:-}"           # "--https" включает nginx+certbot
@@ -54,7 +54,7 @@ sudo chown -R "$SERVICE_USER:$SERVICE_USER" "$APP_DIR"
 echo "==> Настройка окружения в systemd-юните"
 sudo sed -i \
   -e "s|ЗАМЕНИТЕ_НА_ДЛИННУЮ_СЛУЧАЙНУЮ_СТРОКУ|$JWT_SECRET|" \
-  -e "s|ВАШ_НОМЕР_ВЛАДЕЛЬЦА|$ADMIN_PHONE|" \
+  -e "s|ВАШ_НОМЕР_ВЛАДЕЛЬЦА|$ADMIN_USERNAME|" \
   "$APP_DIR/meno.service" 2>/dev/null || true
 sudo cp -f meno.service /etc/systemd/system/meno.service
 

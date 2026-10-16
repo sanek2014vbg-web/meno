@@ -10,7 +10,7 @@ User=meno
 Group=meno
 WorkingDirectory=/opt/meno/server
 Environment=MENO_JWT_SECRET=ЗАМЕНИТЕ_НА_ДЛИННУЮ_СЛУЧАЙНУЮ_СТРОКУ
-Environment=MENO_ADMIN_PHONE=ВАШ_НОМЕР_ВЛАДЕЛЬЦА
+Environment=MENO_ADMIN_USERNAME=owner
 # Санитизированный access-лог (без токенов/тел запросов) включён по умолчанию:
 # Environment=MENO_LOG_ACCESS=1
 # "test" печатает коды в лог; на проде можно "telegram" с ботом:

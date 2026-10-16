@@ -67,7 +67,7 @@ class SettingsView:
                 ft.Text("Потребуется повторный вход", size=12, color=c["sub"]),
             ])]),
             self._card("👤 Аккаунт", [
-                ft.Text(f"Номер: {user.get('phone', '')}", size=14),
+                ft.Text(f"@{user.get('username', '')}", size=14),
                 ft.Text(f"Имя: {user.get('display_name', '') or '—'}", size=14),
                 ft.Text(f"Роль: {'Владелец (DevMode)' if is_admin else 'Пользователь'}", size=14,
                         color=themes.ACCENT if is_admin else c["sub"]),

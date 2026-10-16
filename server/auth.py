@@ -61,9 +61,9 @@ def generate_totp_secret() -> str:
     return pyotp.random_base32()
 
 
-def totp_provisioning_uri(secret: str, phone: str) -> str:
+def totp_provisioning_uri(secret: str, name: str) -> str:
     """Ссылка/QR для добавления в Google Authenticator и подобные."""
-    return pyotp.TOTP(secret).provisioning_uri(name=phone, issuer_name=config.APP_NAME)
+    return pyotp.TOTP(secret).provisioning_uri(name=name, issuer_name=config.APP_NAME)
 
 
 def verify_totp(secret: str, code: str) -> bool:
@@ -125,6 +125,7 @@ async def get_user_by_id(user_id: int) -> Optional[dict]:
 
 
 async def get_user_by_phone(phone: str) -> Optional[dict]:
+    """Legacy-поиск по телефону (оставлен для старых БД/скриптов)."""
     cache_key = f"user:phone:{phone}"
     cached = await cache.get(cache_key)
     if cached:
@@ -137,6 +138,20 @@ async def get_user_by_phone(phone: str) -> Optional[dict]:
         return user
 
 
+async def get_user_by_username(username: str) -> Optional[dict]:
+    """Основной способ нахождения аккаунта — по уникальному username."""
+    cache_key = f"user:name:{username}"
+    cached = await cache.get(cache_key)
+    if cached:
+        return cached
+
+    async with database.get_db() as db:
+        user = await database.aq1(db, "SELECT * FROM users WHERE username=:username", {"username": username})
+        if user:
+            await cache.set(cache_key, user, ttl=300)
+        return user
+
+
 async def touch_last_seen(user_id: int) -> None:
     async with database.get_db() as db:
         await db.execute(
@@ -144,13 +159,14 @@ async def touch_last_seen(user_id: int) -> None:
         )
         # Инвалидируем кеш профиля, так как last_seen изменился
         await cache.delete(f"user:id:{user_id}")
+        await cache.delete_by_prefix("user:name:")
 
 
 def user_to_public(u: dict) -> dict:
     """Публичное представление пользователя — без пароля и секретов 2FA."""
     return {
         "id": u["id"],
-        "phone": u["phone"],
+        "username": u.get("username") or "",
         "display_name": u["display_name"],
         "role": u["role"],
         "avatar_path": u.get("avatar_path"),

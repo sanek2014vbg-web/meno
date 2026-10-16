@@ -15,7 +15,6 @@ from sqlalchemy import (
     Column, Integer, String, Text, Boolean,
     ForeignKey, DateTime, Index, text, select
 )
-from sqlalchemy.dialects.postgresql import TSVECTOR
 
 from sqlalchemy.ext.asyncio import (
     create_async_engine, 
@@ -26,7 +25,7 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy.orm import DeclarativeBase, relationship
 from sqlalchemy.sql import text as sql_text
 
-from server.config import DATABASE_URL
+from server.config import DATABASE_URL, IS_SQLITE
 
 logger = logging.getLogger("meno.database")
 
@@ -40,7 +39,10 @@ class Base(AsyncAttrs, DeclarativeBase):
 class User(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True, autoincrement=True)
-    phone = Column(String, unique=True, nullable=False)
+    # Уникальный username вместо телефона: регистрация без номера телефона.
+    # Колонка `phone` сохранена (nullable) только для совместимости со старыми БД.
+    username = Column(String(32), unique=True, index=True, nullable=True)
+    phone = Column(String, unique=True, nullable=True)
     password_hash = Column(String, nullable=False)
     display_name = Column(String, server_default='')
     role = Column(String, server_default='user')
@@ -56,7 +58,8 @@ class User(Base):
 class VerifyCode(Base):
     __tablename__ = "verify_codes"
     id = Column(Integer, primary_key=True, autoincrement=True)
-    phone = Column(String, nullable=False)
+    target = Column(String, nullable=True)  # email/username (email-верификация)
+    phone = Column(String, nullable=True)   # legacy
     code = Column(String, nullable=False)
     purpose = Column(String, server_default='register')
     expires_at = Column(DateTime, nullable=False)
@@ -94,8 +97,7 @@ class Message(Base):
     created_at = Column(DateTime, server_default=text("CURRENT_TIMESTAMP"))
 
     __table_args__ = (
-        Index("idx_messages_chat_id_id_desc", "chat_id", text("id DESC")),
-        Index("idx_messages_content_fts", "content", postgresql_using="gin"),
+        Index("idx_messages_chat_id_id_desc", "chat_id", text("id DESC") if not IS_SQLITE else "id"),
     )
 
 class Report(Base):

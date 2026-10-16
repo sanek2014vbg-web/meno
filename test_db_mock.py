@@ -57,8 +57,8 @@ async def run_mock_tests():
             
             # Создаем пользователя
             await session.execute(
-                text("INSERT INTO users (phone, password_hash) VALUES (:p, :h)"),
-                {"p": "79990000000", "h": "hashed_pw"}
+                text("INSERT INTO users (username, password_hash) VALUES (:p, :h)"),
+                {"p": "mock_tester", "h": "hashed_pw"}
             )
             # Создаем чат
             await session.execute(

@@ -1,11 +1,31 @@
 import os
 
+def _normalize_db_url(url: str) -> str:
+    """Приводит строку подключения к asyncpg-драйверу.
+
+    Поддерживает форматы, которые выдают бесплатные хостинги (Neon/Supabase):
+    postgresql://..., postgres://..., ?sslmode=require и т.п.
+    """
+    for prefix in ("postgres+asyncpg://", "postgresql+asyncpg://"):
+        if url.startswith(prefix):
+            return url
+    if url.startswith("postgresql://"):
+        return url.replace("postgresql://", "postgresql+asyncpg://", 1)
+    if url.startswith("postgres://"):
+        return url.replace("postgres://", "postgresql+asyncpg://", 1)
+    return url
+
 # --- Database ---
 # PostgreSQL connection string: postgresql+asyncpg://user:pass@host:port/dbname
-DATABASE_URL = os.environ.get("MENO_DATABASE_URL", "postgresql+asyncpg://meno_user:meno_password@localhost:5432/meno_db")
+# Локально без сервера можно использовать SQLite: sqlite+aiosqlite:///./meno.db
+DATABASE_URL = _normalize_db_url(
+    os.environ.get("MENO_DATABASE_URL", "sqlite+aiosqlite:///./meno.db")
+)
+IS_SQLITE = DATABASE_URL.startswith("sqlite")
 
 # --- Redis ---
-REDIS_URL = os.environ.get("MENO_REDIS_URL", "redis://localhost:6379/0")
+# Опционален: без него кеширование просто отключается (in-memory fallback).
+REDIS_URL = os.environ.get("MENO_REDIS_URL", "")
 
 # --- Sentry ---
 # DSN для интеграции с Sentry (получается в панели управления Sentry)
@@ -17,28 +37,27 @@ JWT_SECRET = os.environ.get("MENO_JWT_SECRET", "meno-dev-secret-change-me")
 JWT_ALGO = "HS256"
 JWT_EXPIRE_DAYS = 30
 
-# --- Доставка кодов ---
-# "test"     — код выводится в консоль (разработка)
-# "telegram" — код отправляется через Telegram-бота
-# "sms_ru"   — отправка через API SMS.RU
-SMS_MODE = os.environ.get("MENO_SMS_MODE", "test")
-SMS_RU_API_KEY = os.environ.get("MENO_SMS_RU_API_KEY", "")
-SMS_RU_SENDER = os.environ.get("MENO_SMS_RU_SENDER", "MeNo")
-TELEGRAM_BOT_TOKEN = os.environ.get("MENO_TG_BOT_TOKEN", "")
+# --- Доставка кодов (LEGACY, не используется) ---
+# Аутентификация переведена на username + пароль без телефона и SMS.
+# Модули sms.py / sms_ru.py удалены из проекта.
+SMS_MODE = "none"
 
 # --- Владелец проекта (DevMode) ---
-# Номер телефона владельца получает роль admin автоматически при регистрации
-ADMIN_PHONE = os.environ.get("MENO_ADMIN_PHONE", "")
+# Username владельца получает роль admin автоматически при регистрации
+ADMIN_USERNAME = os.environ.get("MENO_ADMIN_USERNAME", "owner")
 
 # --- Файлы ---
 UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads")
 MAX_UPLOAD_MB = 50
 
-# --- S3 / CDN Configuration ---
+# --- S3 / CDN Configuration (опционально) ---
+# Если MENO_S3_ENDPOINT не задан — файлы хранятся локально в UPLOAD_DIR.
+# Это позволяет запускать проект бесплатно без S3/MinIO-серверов.
+S3_ENABLED = bool(os.environ.get("MENO_S3_ENDPOINT", "").strip())
 S3_BUCKET = os.environ.get("MENO_S3_BUCKET", "meno-uploads")
 S3_ENDPOINT = os.environ.get("MENO_S3_ENDPOINT", None) # If None, uses default AWS
-S3_ACCESS_KEY = os.environ.get("MENO_S3_ACCESS_KEY", "minioadmin")
-S3_SECRET_KEY = os.environ.get("MENO_S3_SECRET_KEY", "minioadmin")
+S3_ACCESS_KEY = os.environ.get("MENO_S3_ACCESS_KEY", "")
+S3_SECRET_KEY = os.environ.get("MENO_S3_SECRET_KEY", "")
 S3_REGION = os.environ.get("MENO_S3_REGION", "us-east-1")
 S3_USE_SSL = os.environ.get("MENO_S3_USE_SSL", "True") == "True"
 

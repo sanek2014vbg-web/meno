@@ -24,12 +24,11 @@ class AuthScreen:
             width=360,
             prefix_icon=ft.icons.DNS,
         )
-        self.phone = ft.TextField(
-            label="Номер телефона",
-            hint_text="79991234567",
+        self.username = ft.TextField(
+            label="Имя пользователя",
+            hint_text="например, alice_92",
             width=360,
-            prefix_icon=ft.icons.PHONE_ANDROID,
-            keyboard_type=ft.KeyboardType.PHONE,
+            prefix_icon=ft.icons.PERSON,
         )
         self.password = ft.TextField(
             label="Пароль",
@@ -66,7 +65,7 @@ class AuthScreen:
                             color=themes.ACCENT),
                     self.seg,
                     self.server,
-                    self.phone,
+                    self.username,
                     self.password,
                     self.totp,
                     self.btn,
@@ -81,12 +80,12 @@ class AuthScreen:
         self.mode = e.control.selected[0] if isinstance(e.control.selected, list) else str(e.control.selected)
         registering = self.mode == "register"
         self.btn.content = "Создать аккаунт" if registering else "Войти"
-        self.password.label = "Придумайте пароль (мин. 4 символа)" if registering else "Пароль"
+        self.password.label = "Придумайте пароль (мин. 6 символов)" if registering else "Пароль"
         self.app.page.update()
 
     async def _on_submit(self):
         url = self.server.value.strip()
-        phone = self.phone.value.strip()
+        username = self.username.value.strip().lower()
         if not url.startswith(("http://", "https://")):
             url = "http://" + url
         if url != self.app.api.base_url:
@@ -94,23 +93,23 @@ class AuthScreen:
             self.app.api = ApiClient(url)
             crypto.save_setting("server_url", url)
 
-        if not phone:
-            return self._show_err("Введите номер телефона")
+        if not username:
+            return self._show_err("Введите имя пользователя")
         if self.mode == "login":
-            await self._do_login(phone)
+            await self._do_login(username)
         else:
-            await self._do_register(phone)
+            await self._do_register(username)
 
     def _show_err(self, msg: str):
         self.err.value = msg
         self.err.visible = True
         self.app.page.update()
 
-    async def _do_login(self, phone: str):
+    async def _do_login(self, username: str):
         self.btn.disabled = True
         self.app.page.update()
         try:
-            await self.app.api.login(phone, self.password.value, self.totp.value.strip())
+            await self.app.api.login(username, self.password.value, self.totp.value.strip())
         except ApiError as ex:
             if "2FA" in ex.detail:
                 self.totp.visible = True
@@ -122,19 +121,19 @@ class AuthScreen:
         await self._enter(self.password.value)
         self.btn.disabled = False
 
-    async def _do_register(self, phone: str):
+    async def _do_register(self, username: str):
+        """Регистрация без телефона и кодов: username + пароль сразу создаёт аккаунт."""
         self.btn.disabled = True
         self.app.page.update()
         try:
-            msg = await self.app.api.register(phone)
+            await self.app.api.register(username, self.password.value)
         except ApiError as ex:
             self._show_err(ex.detail)
             self.btn.disabled = False
             self.app.page.update()
             return
-        from screens.verify_screen import VerifyScreen
-        await self.app.set_view(VerifyScreen(self.app, phone).build())
         self.btn.disabled = False
+        await self._enter(self.password.value)
 
     async def _enter(self, password: str):
         """Вход выполнен: E2E-ключи, WebSocket и главное окно.
