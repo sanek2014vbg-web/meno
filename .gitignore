@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Данные и медиа
+meno/server/meno.db
+meno/server/uploads/
+meno/server/dev_keys.json
+
+# Локальные настройки
+.env
+*.local
+
+# IDE
+.vscode/
+.idea/
+
+# Сборка Flet
+meno/client/build/

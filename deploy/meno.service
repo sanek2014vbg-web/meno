@@ -1,0 +1,35 @@
+# MeNo — systemd-сервис бэкенда (FastAPI + Uvicorn).
+# Копируется в /etc/systemd/system/meno.service скриптом setup_vps.sh
+[Unit]
+Description=MeNo messenger backend (FastAPI)
+After=network.target
+
+[Service]
+Type=simple
+User=meno
+Group=meno
+WorkingDirectory=/opt/meno/server
+Environment=MENO_JWT_SECRET=ЗАМЕНИТЕ_НА_ДЛИННУЮ_СЛУЧАЙНУЮ_СТРОКУ
+Environment=MENO_ADMIN_PHONE=ВАШ_НОМЕР_ВЛАДЕЛЬЦА
+# Санитизированный access-лог (без токенов/тел запросов) включён по умолчанию:
+# Environment=MENO_LOG_ACCESS=1
+# "test" печатает коды в лог; на проде можно "telegram" с ботом:
+# Environment=MENO_SMS_MODE=telegram
+# Environment=MENO_TG_BOT_TOKEN=TOKEN
+# Пустой CORS по умолчанию = все источники; сузьте при необходимости:
+# Environment=MENO_CORS_ORIGINS=https://meno.example.com
+# Принудительная запись без буферизации (коды подтверждения в journalctl):
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/meno/.venv/bin/python -m uvicorn main:app --host 0.0.0.0 --port 8000 --no-access-log
+Restart=always
+RestartSec=3
+
+# Безопасность: минимальные привилегии
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/meno/server
+
+[Install]
+WantedBy=multi-user.target
