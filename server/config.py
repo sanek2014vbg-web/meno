@@ -34,6 +34,14 @@ ADMIN_PHONE = os.environ.get("MENO_ADMIN_PHONE", "")
 UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads")
 MAX_UPLOAD_MB = 50
 
+# --- S3 / CDN Configuration ---
+S3_BUCKET = os.environ.get("MENO_S3_BUCKET", "meno-uploads")
+S3_ENDPOINT = os.environ.get("MENO_S3_ENDPOINT", None) # If None, uses default AWS
+S3_ACCESS_KEY = os.environ.get("MENO_S3_ACCESS_KEY", "minioadmin")
+S3_SECRET_KEY = os.environ.get("MENO_S3_SECRET_KEY", "minioadmin")
+S3_REGION = os.environ.get("MENO_S3_REGION", "us-east-1")
+S3_USE_SSL = os.environ.get("MENO_S3_USE_SSL", "True") == "True"
+
 # --- Антиспам ---
 SPAM_MAX_CODES_PER_HOUR = 5   # запросов кода в час с одного номера
 SPAM_MSG_PER_MINUTE = 20      # сообщений в минуту на пользователя
