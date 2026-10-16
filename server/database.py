@@ -48,6 +48,8 @@ class User(Base):
     e2e_pub = Column(Text)
     created_at = Column(DateTime, server_default=text("CURRENT_TIMESTAMP"))
     last_seen = Column(DateTime)
+    failed_attempts = Column(Integer, server_default='0')
+    lockout_until = Column(DateTime)
 
 class VerifyCode(Base):
     __tablename__ = "verify_codes"

@@ -88,8 +88,35 @@ app.add_middleware(
 )
 
 @app.middleware("http")
+async def security_headers_middleware(request: Request, call_next):
+    """Добавление базовых заголовков безопасности (HSTS, CSP, X-Frame-Options)."""
+    response = await call_next(request)
+    
+    # HSTS (Strict-Transport-Security): Принудительный HTTPS (для продакшена)
+    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    
+    # X-Frame-Options: Защита от Clickjacking
+    response.headers["X-Frame-Options"] = "DENY"
+    
+    # X-Content-Type-Options: Запрет MIME-sniffing
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    
+    # Content-Security-Policy (CSP): Ограничение источников контента
+    # По умолчанию разрешаем только свой домен и базовые ресурсы
+    csp = (
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data:; "
+        "connect-src 'self' ws: wss:; "
+        "frame-ancestors 'none';"
+    )
+    response.headers["Content-Security-Policy"] = csp
+    
+    return response
+
+@app.middleware("http")
 async def security_middleware(request: Request, call_next):
-    """Глобальный rate limit по IP + структурированный access-лог."""
     ip = client_ip(request)
     if request.url.path.startswith("/api") and not limiter.allow(
         f"global:{ip}", config.RL_GLOBAL_LIMIT, config.RL_GLOBAL_WINDOW

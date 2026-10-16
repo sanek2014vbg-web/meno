@@ -119,7 +119,7 @@ async def list_chats(user: dict = Depends(get_current_user)):
         all_members_rows = await database.aq(
             db,
             "SELECT cm.chat_id, u.* FROM chat_members cm JOIN users u ON u.id=cm.user_id WHERE cm.chat_id = ANY(:ids)",
-            {"ids": chat_members_ids_list := chat_ids}
+            {"ids": chat_ids}
         )
         
         # Группируем участников по чатам

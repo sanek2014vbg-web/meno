@@ -29,7 +29,7 @@ class PhoneRequest(BaseModel):
 
 class VerifyRequest(BaseModel):
     phone: str = Field(..., pattern=PHONE_PATTERN)
-    code: str = Field(..., min_length=6, max_//C-length=6, description="6-значный код подтверждения")
+    code: str = Field(..., min_length=6, max_length=6, description="6-значный код подтверждения")
     password: str = Field(..., min_length=4, max_length=128, description="Пароль для создания аккаунта")
     display_name: str = Field(default="", max_length=50, description="Имя пользователя")
 
@@ -142,17 +142,31 @@ async def login(body: LoginRequest, request: Request):
         raise HTTPException(429, "Слишком много попыток входа — попробуйте позже")
 
     user = await auth.get_user_by_phone(phone)
-    if not user or not auth.check_password(body.password, user["password_hash"]):
+    if not user:
         raise HTTPException(400, "Неверный номер или пароль")
+
+    # Проверка блокировки
+    locked, until = auth.is_account_locked(user)
+    if locked:
+        wait_min = int((until - datetime.utcnow()).total_seconds() / 60) + 1
+        raise HTTPException(403, f"Аккаунт временно заблокирован. Попробуйте через {wait_min} мин.")
+
+    if not auth.check_password(body.password, user["password_hash"]):
+        await auth.record_failed_attempt(user["id"])
+        raise HTTPException(400, "Неверный номер или пароль")
+
     if user["twofa_enabled"]:
         if not body.totp or not auth.verify_totp(user["totp_secret"], body.totp.strip()):
+            await auth.record_failed_attempt(user["id"])
             raise HTTPException(400, "Требуется код 2FA (Google Authenticator)")
-    await auth.touch_last_seen(user["id"])
-    limiter.reset(key)
     
+    await auth.touch_last_seen(user["id"])
+    await auth.reset_failed_attempts(user["id"])
+    limiter.reset(key)
+
     async with database.get_db() as db:
         tokens = await _issue_tokens(user["id"], db)
-        
+
     return {"tokens": tokens, "user": _public(user)}
 
 @router.post(
@@ -225,7 +239,7 @@ async def set_push_token(body: PushTokenRequest, user: dict = Depends(get_curren
     summary="Отвязка Push-токена",
     description="Удаляет токен устройства при выходе из аккаунта."
 )
-async def remove_push_token(body: PushTokenRequest, user: dict = Depends(get_//C-current_user)):
+async def remove_push_token(body: PushTokenRequest, user: dict = Depends(get_current_user)):
     push_service.unregister_token(user["id"], body.token)
     return {"ok": True}
 

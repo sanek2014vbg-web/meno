@@ -5,6 +5,10 @@ from typing import Optional
 import bcrypt
 import jwt
 import pyotp
+import secrets
+from datetime import datetime, timedelta
+from typing import Optional
+
 
 import config
 import database
@@ -67,6 +71,43 @@ def verify_totp(secret: str, code: str) -> bool:
         return pyotp.TOTP(secret).verify(code, valid_window=1)
     except Exception:
         return False
+
+
+# ---------- Account Lockout ----------
+MAX_FAILED_ATTEMPTS = 5
+LOCKOUT_DURATION_MINUTES = 15
+
+def is_account_locked(user: dict) -> Tuple[bool, Optional[datetime]]:
+    """Проверяет, заблокирован ли аккаунт."""
+    lockout_until = user.get("lockout_until")
+    if lockout_until and lockout_until > datetime.utcnow():
+        return True, lockout_until
+    return False, None
+
+async def record_failed_attempt(user_id: int):
+    """Увеличивает счетчик неудачных попыток и устанавливает блокировку при достижении лимита."""
+    async with database.get_db() as db:
+        user = await database.aq1(db, "SELECT failed_attempts FROM users WHERE id=:id", {"id": user_id})
+        if not user:
+            return
+
+        attempts = user["failed_attempts"] + 1
+        lockout_until = None
+        if attempts >= MAX_FAILED_ATTEMPTS:
+            lockout_until = datetime.utcnow() + timedelta(minutes=LOCKOUT_DURATION_MINUTES)
+
+        await db.execute(
+            "UPDATE users SET failed_attempts=:a, lockout_until=:l WHERE id=:id",
+            {"a": attempts, "l": lockout_until, "id": user_id}
+        )
+
+async def reset_failed_attempts(user_id: int):
+    """Сбрасывает счетчик попыток при успешном входе."""
+    async with database.get_db() as db:
+        await db.execute(
+            "UPDATE users SET failed_attempts=0, lockout_until=NULL WHERE id=:id",
+            {"id": user_id}
+        )
 
 
 # ---------- Пользователи (с кешированием) ----------
