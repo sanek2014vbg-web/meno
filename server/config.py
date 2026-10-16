@@ -2,10 +2,10 @@ import os
 
 # --- Database ---
 # PostgreSQL connection string: postgresql+asyncpg://user:pass@host:port/dbname
-DATABASE_URL = os.environ.get("MENO_DATABASE_URL", "postgresql+asyncpg://meno_user:meno_password@db:5432/meno_db")
+DATABASE_URL = os.environ.get("MENO_DATABASE_URL", "postgresql+asyncpg://meno_user:meno_password@localhost:5432/meno_db")
 
 # --- Redis ---
-REDIS_URL = os.environ.get("MENO_REDIS_URL", "redis://redis:6379/0")
+REDIS_URL = os.environ.get("MENO_REDIS_URL", "redis://localhost:6379/0")
 
 # --- Sentry ---
 # DSN для интеграции с Sentry (получается в панели управления Sentry)

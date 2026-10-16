@@ -4,7 +4,7 @@ from typing import Optional
 
 import database
 from deps import get_current_user, is_chat_member
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 import config
