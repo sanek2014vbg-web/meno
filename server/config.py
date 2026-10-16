@@ -1,8 +1,11 @@
-"""MeNo — конфигурация сервера.
-
-Все секреты переопределяются переменными окружения (на VPS зададим в systemd).
-"""
 import os
+
+# --- Database ---
+# PostgreSQL connection string: postgresql+asyncpg://user:pass@host:port/dbname
+DATABASE_URL = os.environ.get("MENO_DATABASE_URL", "postgresql+asyncpg://meno_user:meno_password@db:5432/meno_db")
+
+# --- Redis ---
+REDIS_URL = os.environ.get("MENO_REDIS_URL", "redis://redis:6379/0")
 
 # --- JWT ---
 # В продакшене обязательно задать MENO_JWT_SECRET (случайная длинная строка)
@@ -13,7 +16,10 @@ JWT_EXPIRE_DAYS = 30
 # --- Доставка кодов ---
 # "test"     — код выводится в консоль (разработка)
 # "telegram" — код отправляется через Telegram-бота
+# "sms_ru"   — отправка через API SMS.RU
 SMS_MODE = os.environ.get("MENO_SMS_MODE", "test")
+SMS_RU_API_KEY = os.environ.get("MENO_SMS_RU_API_KEY", "")
+SMS_RU_SENDER = os.environ.get("MENO_SMS_RU_SENDER", "MeNo")
 TELEGRAM_BOT_TOKEN = os.environ.get("MENO_TG_BOT_TOKEN", "")
 
 # --- Владелец проекта (DevMode) ---

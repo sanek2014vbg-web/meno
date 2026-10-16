@@ -1,0 +1,69 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: meno-db
+    restart: always
+    environment:
+      POSTGRES_USER: meno_user
+      POSTGRES_PASSWORD: meno_password
+      POSTGRES_DB: meno_db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - meno-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U meno_user -d meno_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: meno-redis
+    restart: always
+    command: redis-server --save 60 1 --loglevel warning
+    volumes:
+      - redis_data:/data
+    networks:
+      - meno-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  server:
+    build: 
+      context: .
+      dockerfile: server/Dockerfile
+    container_name: meno-server
+    restart: always
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      - MENO_DATABASE_URL=postgresql+asyncpg://meno_user:meno_password@db:5432/meno_db
+      - MENO_REDIS_URL=redis://redis:6379/0
+      - MENO_JWT_SECRET=${MENO_JWT_SECRET:-meno-dev-secret}
+      - MENO_SMS_MODE=${MENO_SMS_MODE:-sms_ru}
+      - MENO_SMS_RU_API_KEY=${MENO_SMS_RU_API_KEY}
+      - MENO_SMS_RU_SENDER=${MENO_SMS_RU_SENDER:-MeNo}
+      - MENO_ADMIN_PHONE=${MENO_ADMIN_PHONE}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./server/uploads:/app/server/uploads
+    networks:
+      - meno-network
+
+networks:
+  meno-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:

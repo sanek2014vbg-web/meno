@@ -1,229 +1,179 @@
-"""MeNo — модуль базы данных (SQLite, боевой режим).
+"""MeNo — модуль базы данных (PostgreSQL, SQLAlchemy + asyncpg).
 
-Боевая отказоустойчивость под высокую нагрузку:
-- WAL (Write-Ahead Logging): параллельное чтение во время записи,
-  устойчивость к обрывам процесса, отсутствие «database is locked»
-  при одновременной записи логов и E2E-сообщений;
-- пул соединений с таймаутом ожидания блокировок (busy_timeout),
-  чтобы конкурентные запросы не падали с ошибкой блокировки файла;
-- synchronous=NORMAL — оптимальный баланс скорости и надёжности в WAL.
+Переход на PostgreSQL обеспечивает:
+- Полноценную многопользовательскую работу без блокировок файлов;
+- Строгую типизацию данных через SQLAlchemy модели;
+- Асинхронность (asyncpg), что критично для FastAPI сервера под нагрузкой;
+- Масштабируемость и надежность хранения данных.
 """
 import os
-import queue
-import sqlite3
-import threading
-from collections.abc import Generator
-from contextlib import contextmanager
-from typing import Any, Dict, List, Optional, Tuple
+import logging
+from typing import Any, Dict, List, Optional, Tuple, Sequence
+from contextlib import asynccontextmanager
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "meno.db")
+from sqlalchemy import (
+    Column, Integer, String, Text, Boolean, 
+    ForeignKey, DateTime, Index, text, select
+)
+from sqlalchemy.ext.asyncio import (
+    create_async_engine, 
+    AsyncSession, 
+    async_sessionmaker, 
+    AsyncAttrs
+)
+from sqlalchemy.orm import DeclarativeBase, relationship
+from sqlalchemy.sql import text as sql_text
 
-# Параметры пула соединений (высоконагруженный режим)
-POOL_SIZE = 8            # максимум одновременно открытых соединений
-BUSY_TIMEOUT_MS = 5000   # ждать снятия блокировки до 5 секунд (вместо мгновенной ошибки)
-CONNECT_TIMEOUT_S = 30   # сколько ждать свободное соединение из пула
+from server.config import DATABASE_URL
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS users (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    phone         TEXT UNIQUE NOT NULL,
-    password_hash TEXT NOT NULL,
-    display_name  TEXT DEFAULT '',
-    role          TEXT DEFAULT 'user',
-    totp_secret   TEXT,
-    twofa_enabled INTEGER DEFAULT 0,
-    avatar_path   TEXT,
-    e2e_pub       TEXT,
-    created_at    TEXT DEFAULT (datetime('now')),
-    last_seen     TEXT
-);
+logger = logging.getLogger("meno.database")
 
-CREATE TABLE IF NOT EXISTS verify_codes (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    phone      TEXT NOT NULL,
-    code       TEXT NOT NULL,
-    purpose    TEXT DEFAULT 'register',
-    expires_at TEXT NOT NULL,
-    used       INTEGER DEFAULT 0,
-    created_at TEXT DEFAULT (datetime('now'))
-);
+# --- SQLAlchemy Base ---
+class Base(AsyncAttrs, DeclarativeBase):
+    """Базовый класс для всех моделей БД."""
+    pass
 
-CREATE TABLE IF NOT EXISTS chats (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    type       TEXT NOT NULL,
-    title      TEXT DEFAULT '',
-    created_by INTEGER,
-    created_at TEXT DEFAULT (datetime('now'))
-);
+# --- Models ---
 
-CREATE TABLE IF NOT EXISTS chat_members (
-    chat_id   INTEGER NOT NULL,
-    user_id   INTEGER NOT NULL,
-    role      TEXT DEFAULT 'member',
-    joined_at TEXT DEFAULT (datetime('now')),
-    PRIMARY KEY (chat_id, user_id)
-);
+class User(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    phone = Column(String, unique=True, nullable=False)
+    password_hash = Column(String, nullable=False)
+    display_name = Column(String, server_default='')
+    role = Column(String, server_default='user')
+    totp_secret = Column(String)
+    twofa_enabled = Column(Integer, server_default='0')
+    avatar_path = Column(String)
+    e2e_pub = Column(Text)
+    created_at = Column(DateTime, server_default=text("CURRENT_TIMESTAMP"))
+    last_seen = Column(DateTime)
 
-CREATE TABLE IF NOT EXISTS messages (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    chat_id     INTEGER NOT NULL,
-    sender_id   INTEGER NOT NULL,
-    type        TEXT DEFAULT 'text',
-    content     TEXT DEFAULT '',
-    media_path  TEXT,
-    ttl_seconds INTEGER,
-    view_once   INTEGER DEFAULT 0,
-    viewed      INTEGER DEFAULT 0,
-    e2e         INTEGER DEFAULT 0,
-    created_at  TEXT DEFAULT (datetime('now'))
-);
+class VerifyCode(Base):
+    __tablename__ = "verify_codes"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    phone = Column(String, nullable=False)
+    code = Column(String, nullable=False)
+    purpose = Column(String, server_default='register')
+    expires_at = Column(DateTime, nullable=False)
+    used = Column(Integer, server_default='0')
+    created_at = Column(DateTime, server_default=text("CURRENT_TIMESTAMP"))
 
-CREATE TABLE IF NOT EXISTS reports (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    chat_id     INTEGER NOT NULL,
-    message_id  INTEGER NOT NULL,
-    reporter_id INTEGER NOT NULL,
-    reason      TEXT DEFAULT '',
-    status      TEXT DEFAULT 'open',
-    created_at  TEXT DEFAULT (datetime('now'))
-);
+class Chat(Base):
+    __tablename__ = "chats"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    type = Column(String, nullable=False)
+    title = Column(String, server_default='')
+    created_by = Column(Integer, ForeignKey("users.id"))
+    created_at = Column(DateTime, server_default=text("CURRENT_TIMESTAMP"))
 
-CREATE TABLE IF NOT EXISTS settings (
-    key   TEXT PRIMARY KEY,
-    value TEXT
-);
+class ChatMember(Base):
+    __tablename__ = "chat_members"
+    chat_id = Column(Integer, ForeignKey("chats.id"), primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), primary_key=True)
+    role = Column(String, server_default='member')
+    joined_at = Column(DateTime, server_default=text("CURRENT_TIMESTAMP"))
 
-CREATE TABLE IF NOT EXISTS push_tokens (
-    user_id    INTEGER NOT NULL,
-    token      TEXT PRIMARY KEY,
-    platform   TEXT DEFAULT 'android',
-    created_at TEXT DEFAULT (datetime('now'))
-);
-
-CREATE INDEX IF NOT EXISTS idx_messages_chat ON messages (chat_id, id);
-CREATE INDEX IF NOT EXISTS idx_chat_members_user ON chat_members (user_id);
-CREATE INDEX IF NOT EXISTS idx_reports_status ON reports (status);
-CREATE INDEX IF NOT EXISTS idx_push_tokens_user ON push_tokens (user_id);
-"""
-
-
-class _ConnPool:
-    """Пул потокобезопасных соединений SQLite.
-
-    Соединение возвращается в пул после каждой операции; если пул полон,
-    поток ожидает освобождения до CONNECT_TIMEOUT_S. Все соединения
-    открываются с WAL, busy_timeout и foreign_keys — это исключает
-    «database is locked» при конкурентной записи.
-    """
-
-    def __init__(self, size: int = POOL_SIZE) -> None:
-        self._pool: "queue.Queue[sqlite3.Connection]" = queue.Queue(maxsize=size)
-        self._size = size
-        self._lock = threading.Lock()
-        self._created = 0
-
-    @staticmethod
-    def _new() -> sqlite3.Connection:
-        conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=CONNECT_TIMEOUT_S)
-        conn.row_factory = sqlite3.Row
-        # WAL: параллельные читатели + один писатель, без «lock» при обрыве
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=%d" % BUSY_TIMEOUT_MS)
-        conn.execute("PRAGMA foreign_keys=ON")
-        # synchronous=NORMAL: fsync только на чекпоинтах WAL (скорость+надёжность)
-        conn.execute("PRAGMA synchronous=NORMAL")
-        return conn
-
-    def acquire(self) -> sqlite3.Connection:
-        try:
-            return self._pool.get_nowait()
-        except queue.Empty:
-            pass
-        # Создаём новое соединение, пока не упёрлись в максимум пула
-        with self._lock:
-            if self._created < self._size:
-                self._created += 1
-                return self._new()
-        # Пул исчерпан — ждём освобождения соединения
-        return self._pool.get(timeout=CONNECT_TIMEOUT_S)
-
-    def release(self, conn: sqlite3.Connection) -> None:
-        try:
-            self._pool.put_nowait(conn)
-        except queue.Full:
-            try:
-                conn.close()
-            except Exception:
-                pass
-
-    def close_all(self) -> None:
-        """Закрывает все соединения (при остановке сервера)."""
-        while True:
-            try:
-                conn = self._pool.get_nowait()
-                conn.close()
-            except queue.Empty:
-                break
-
-
-_pool = _ConnPool()
-
-
-@contextmanager
-def get_db() -> Generator[sqlite3.Connection, None, None]:
-    """Возвращает соединение из пула. Каждая операция коммитится по выходу."""
-    conn = _pool.acquire()
-    try:
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        _pool.release(conn)
-
-
-def init_db() -> None:
-    """Создаёт таблицы при первом запуске + миграции для существующих БД."""
-    with get_db() as db:
-        db.executescript(SCHEMA)
-        _migrate(db)
-
-
-def close_pool() -> None:
-    """Закрывает пул соединений (вызывается при остановке приложения)."""
-    _pool.close_all()
-
-
-def _migrate(db: sqlite3.Connection) -> None:
-    """Добавляет новые колонки в уже созданные таблицы (безопасно, идемпотентно)."""
-    user_cols = {r["name"] for r in db.execute("PRAGMA table_info(users)")}
-    if "e2e_pub" not in user_cols:
-        db.execute("ALTER TABLE users ADD COLUMN e2e_pub TEXT")
-
-    msg_cols = {r["name"] for r in db.execute("PRAGMA table_info(messages)")}
-    if "e2e" not in msg_cols:
-        db.execute("ALTER TABLE messages ADD COLUMN e2e INTEGER DEFAULT 0")
-
-    # Таблица push-токенов (добавлена в 1.1.0)
-    db.execute(
-        "CREATE TABLE IF NOT EXISTS push_tokens ("
-        " user_id INTEGER NOT NULL,"
-        " token TEXT PRIMARY KEY,"
-        " platform TEXT DEFAULT 'android',"
-        " created_at TEXT DEFAULT (datetime('now'))"
-        ")"
+class Message(Base):
+    __tablename__ = "messages"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    chat_id = Column(Integer, ForeignKey("chats.id"), nullable=False)
+    sender_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    type = Column(String, server_default='text')
+    content = Column(Text, server_default='')
+    media_path = Column(String)
+    ttl_seconds = Column(Integer)
+    view_once = Column(Integer, server_default='0')
+    viewed = Column(Integer, server_default='0')
+    e2e = Column(Integer, server_default='0')
+    created_at = Column(DateTime, server_default=text("CURRENT_TIMESTAMP"))
+    
+    __table_args__ = (
+        Index("idx_messages_chat", "chat_id", "id"),
     )
-    db.execute("CREATE INDEX IF NOT EXISTS idx_push_tokens_user ON push_tokens (user_id)")
 
+class Report(Base):
+    __tablename__ = "reports"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    chat_id = Column(Integer, ForeignKey("chats.id"), nullable=False)
+    message_id = Column(Integer, ForeignKey("messages.id"), nullable=False)
+    reporter_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    reason = Column(Text, server_default='')
+    status = Column(String, server_default='open')
+    created_at = Column(DateTime, server_default=text("CURRENT_TIMESTAMP"))
+    
+    __table_args__ = (
+        Index("idx_reports_status", "status"),
+    )
 
-def q(db: sqlite3.Connection, sql: str, params: Tuple[Any, ...] = ()) -> List[Dict[str, Any]]:
-    """Выполняет SELECT и возвращает список словарей."""
-    rows = db.execute(sql, params).fetchall()
-    return [dict(r) for r in rows]
+class Setting(Base):
+    __tablename__ = "settings"
+    key = Column(String, primary_key=True)
+    value = Column(String)
 
+class PushToken(Base):
+    __tablename__ = "push_tokens"
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    token = Column(String, primary_key=True)
+    platform = Column(String, server_default='android')
+    created_at = Column(DateTime, server_default=text("CURRENT_TIMESTAMP"))
+    
+    __table_args__ = (
+        Index("idx_push_tokens_user", "user_id"),
+    )
 
-def q1(db: sqlite3.Connection, sql: str, params: Tuple[Any, ...] = ()) -> Optional[Dict[str, Any]]:
-    """Выполняет SELECT и возвращает одну строку (или None)."""
-    row = db.execute(sql, params).fetchone()
-    return dict(row) if row else None
+# --- Engine & Session ---
+
+# pool_size=8 matches original POOL_SIZE
+# max_overflow=2 allows brief spikes
+engine = create_async_engine(
+    DATABASE_URL, 
+    echo=False, 
+    pool_size=8, 
+    max_overflow=2
+)
+
+AsyncSessionLocal = async_sessionmaker(
+    bind=engine, 
+    class_=AsyncSession, 
+    expire_on_commit=False
+)
+
+@asynccontextmanager
+async def get_db():
+    """Асинхронный контекстный менеджер для получения сессии БД."""
+    async with AsyncSessionLocal() as session:
+        try:
+            yield session
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
+        finally:
+            await session.close()
+
+async def init_db() -> None:
+    """Создаёт все таблицы в PostgreSQL на основе моделей SQLAlchemy."""
+    async with engine.begin() as conn:
+        # В Postgres create_all работает асинхронно через run_sync
+        await conn.run_sync(Base.metadata.create_all)
+    logger.info("Database schema initialized in PostgreSQL.")
+
+async def close_pool() -> None:
+    """Закрывает пул соединений."""
+    await engine.dispose()
+
+# --- Compatibility Helpers (Shim layer) ---
+# Эти функции позволяют постепенно обновлять роуты, переходя от q() к aq()
+
+async def aq(session: AsyncSession, sql: str, params: Tuple[Any, ...] = ()) -> List[Dict[str, Any]]:
+    """Асинхронный аналог q(): выполняет SELECT и возвращает список словарей."""
+    result = await session.execute(sql_text(sql), params)
+    # Преобразуем строки SQLAlchemy в словари
+    return [dict(row._mapping) for row in result.all()]
+
+async def aq1(session: AsyncSession, sql: str, params: Tuple[Any, ...] = ()) -> Optional[Dict[str, Any]]:
+    """Асинхронный аналог q1(): выполняет SELECT и возвращает одну строку или None."""
+    result = await session.execute(sql_text(sql), params)
+    row = result.first()
+    return dict(row._mapping) if row else None
