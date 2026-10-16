@@ -12,9 +12,11 @@ from typing import Any, Dict, List, Optional, Tuple, Sequence
 from contextlib import asynccontextmanager
 
 from sqlalchemy import (
-    Column, Integer, String, Text, Boolean, 
+    Column, Integer, String, Text, Boolean,
     ForeignKey, DateTime, Index, text, select
 )
+from sqlalchemy.dialects.postgresql import TSVECTOR
+
 from sqlalchemy.ext.asyncio import (
     create_async_engine, 
     AsyncSession, 
@@ -84,6 +86,7 @@ class Message(Base):
     type = Column(String, server_default='text')
     content = Column(Text, server_default='')
     media_path = Column(String)
+    duration = Column(Integer, server_default='0')
     ttl_seconds = Column(Integer)
     view_once = Column(Integer, server_default='0')
     viewed = Column(Integer, server_default='0')
@@ -92,6 +95,7 @@ class Message(Base):
 
     __table_args__ = (
         Index("idx_messages_chat_id_id_desc", "chat_id", text("id DESC")),
+        Index("idx_messages_content_fts", "content", postgresql_using="gin"),
     )
 
 class Report(Base):

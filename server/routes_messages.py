@@ -18,6 +18,7 @@ class SendMessageRequest(BaseModel):
     type: str = Field(default="text", pattern="^(text|image|file|voice|emoji)$")
     content: str = Field(default="", max_length=4000)
     media_path: str = Field(default="")
+    duration: Optional[int] = Field(default=0, description="Длительность аудио в секундах")
     ttl_seconds: Optional[int] = Field(default=None, ge=5, le=86400 * 7)
     view_once: bool = False
     e2e: bool = False  # сообщение зашифровано клиентом (E2E для личных чатов)
@@ -35,6 +36,7 @@ class MessageResponse(BaseModel):
     type: str
     content: str
     media_path: Optional[str]
+    duration: Optional[int] = 0
     ttl_seconds: Optional[int]
     view_once: bool
     viewed: bool
@@ -113,6 +115,60 @@ async def list_messages(
         )
 
 
+@router.get("/chats/{chat_id}/search", response_model=MessagesListResponse)
+async def search_messages(
+    chat_id: int,
+    q: str = Query(..., min_length=3, max_length=100),
+    limit: int = 50,
+    before_id: Optional[int] = None,
+    user: dict = Depends(get_current_user),
+):
+    """Полнотекстовый поиск сообщений в чате.
+    
+    Использует PostgreSQL tsvector для быстрого поиска по контенту.
+    """
+    if limit > 200:
+        limit = 200
+    
+    async with database.get_db() as db:
+        if not await is_chat_member(chat_id, user["id"]):
+            raise HTTPException(403, "Вы не участник этого чата")
+
+        # Формируем запрос для полнотекстового поиска.
+        # plainto_tsquery преобразует обычный текст в поисковый запрос Postgres.
+        sql = (
+            "SELECT m.*, u.display_name AS sender_name "
+            "FROM messages m "
+            "JOIN users u ON u.id = m.sender_id "
+            "WHERE m.chat_id = :chat_id "
+            "AND to_tsvector('english', m.content) @@ plainto_tsquery('english', :q) "
+        )
+        params = {"chat_id": chat_id, "q": q}
+
+        if before_id:
+            sql += " AND m.id < :before_id ORDER BY m.id DESC LIMIT :limit"
+            params.update({"before_id": before_id, "limit": limit})
+        else:
+            sql += " ORDER BY m.id DESC LIMIT :limit"
+            params.update({"limit": limit})
+
+        rows = await database.aq(db, sql, params)
+
+        if not rows:
+            return MessagesListResponse(messages=[], next_cursor=None, has_more=False)
+
+        sorted_rows = list(reversed(rows))
+        messages = [_serialize_msg(m) for m in sorted_rows]
+        
+        next_cursor = rows[0]["id"]
+        has_more = len(rows) == limit
+
+        return MessagesListResponse(
+            messages=messages,
+            next_cursor=next_cursor,
+            has_more=has_more
+        )
+
 @router.post("/chats/{chat_id}/messages")
 async def send_message(
     chat_id: int, body: SendMessageRequest, user: dict = Depends(get_current_user)
@@ -135,19 +191,21 @@ async def send_message(
             raise HTTPException(400, "Пустое сообщение")
 
         await db.execute(
-            "INSERT INTO messages (chat_id, sender_id, type, content, media_path, ttl_seconds, view_once, e2e) "
-            "VALUES (:chat_id, :sender_id, :type, :content, :media_path, :ttl, :view_once, :e2e)",
+            "INSERT INTO messages (chat_id, sender_id, type, content, media_path, duration, ttl_seconds, view_once, e2e) "
+            "VALUES (:chat_id, :sender_id, :type, :content, :media_path, :duration, :ttl, :view_once, :e2e)",
             {
                 "chat_id": chat_id,
                 "sender_id": user["id"],
                 "type": body.type,
                 "content": body.content.strip(),
                 "media_path": body.media_path,
+                "duration": body.duration or 0,
                 "ttl": body.ttl_seconds,
                 "view_once": 1 if body.view_once else 0,
                 "e2e": 1 if body.e2e else 0,
             },
         )
+
         # Получаем сообщение вместе с именем отправителя для WebSocket-payload
         msg = await database.aq1(
             db, 
