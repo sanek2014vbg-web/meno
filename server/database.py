@@ -89,9 +89,9 @@ class Message(Base):
     viewed = Column(Integer, server_default='0')
     e2e = Column(Integer, server_default='0')
     created_at = Column(DateTime, server_default=text("CURRENT_TIMESTAMP"))
-    
+
     __table_args__ = (
-        Index("idx_messages_chat", "chat_id", "id"),
+        Index("idx_messages_chat_id_id_desc", "chat_id", text("id DESC")),
     )
 
 class Report(Base):
