@@ -27,25 +27,44 @@ class MarkViewedRequest(BaseModel):
     pass
 
 
-def _serialize_msg(m: dict) -> dict:
-    """Превращает строку из БД в API-ответ. Данные отправителя уже должны быть в m."""
-    return {
-        "id": m["id"],
-        "chat_id": m["chat_id"],
-        "sender_id": m["sender_id"],
-        "sender_name": m.get("sender_name", ""),
-        "type": m["type"],
-        "content": m["content"],
-        "media_path": m["media_path"],
-        "ttl_seconds": m["ttl_seconds"],
-        "view_once": m["view_once"],
-        "viewed": m["viewed"],
-        "e2e": bool(m.get("e2e")),
-        "created_at": m["created_at"],
-    }
+class MessageResponse(BaseModel):
+    id: int
+    chat_id: int
+    sender_id: int
+    sender_name: str
+    type: str
+    content: str
+    media_path: Optional[str]
+    ttl_seconds: Optional[int]
+    view_once: bool
+    viewed: bool
+    e2e: bool
+    created_at: datetime
+
+class MessagesListResponse(BaseModel):
+    messages: List[MessageResponse]
+    next_cursor: Optional[int] = None
+    has_more: bool
+
+def _serialize_msg(m: dict) -> MessageResponse:
+    """Превращает строку из БД в Pydantic-модель сообщения."""
+    return MessageResponse(
+        id=m["id"],
+        chat_id=m["chat_id"],
+        sender_id=m["sender_id"],
+        sender_name=m.get("sender_name", ""),
+        type=m["type"],
+        content=m["content"],
+        media_path=m["media_path"],
+        ttl_seconds=m["ttl_seconds"],
+        view_once=bool(m["view_once"]),
+        viewed=bool(m["viewed"]),
+        e2e=bool(m.get("e2e")),
+        created_at=m["created_at"],
+    )
 
 
-@router.get("/chats/{chat_id}/messages")
+@router.get("/chats/{chat_id}/messages", response_model=MessagesListResponse)
 async def list_messages(
     chat_id: int,
     limit: int = 50,
@@ -57,9 +76,7 @@ async def list_messages(
     async with database.get_db() as db:
         if not await is_chat_member(chat_id, user["id"]):
             raise HTTPException(403, "Вы не участник этого чата")
-        
-        # ОПТИМИЗАЦИЯ: Используем JOIN для получения имен отправителей одним запросом.
-        # Решаем проблему N+1.
+
         sql = (
             "SELECT m.*, u.display_name AS sender_name "
             "FROM messages m "
@@ -67,17 +84,33 @@ async def list_messages(
             "WHERE m.chat_id = :chat_id "
         )
         params = {"chat_id": chat_id}
-        
+
         if before_id:
             sql += " AND m.id < :before_id ORDER BY m.id DESC LIMIT :limit"
             params.update({"before_id": before_id, "limit": limit})
         else:
             sql += " ORDER BY m.id DESC LIMIT :limit"
             params.update({"limit": limit})
-            
+
         rows = await database.aq(db, sql, params)
         
-        return [_serialize_msg(m) for m in reversed(rows)]
+        if not rows:
+            return MessagesListResponse(messages=[], next_cursor=None, has_more=False)
+
+        # Сообщения в БД были отсортированы DESC (от новых к старым)
+        # Для клиента возвращаем в порядке возрастания ID (от старых к новым)
+        sorted_rows = list(reversed(rows))
+        messages = [_serialize_msg(m) for m in sorted_rows]
+        
+        # Курсор для следующей страницы — это ID самого старого сообщения в текущем батче
+        next_cursor = rows[0]["id"] 
+        has_more = len(rows) == limit
+
+        return MessagesListResponse(
+            messages=messages,
+            next_cursor=next_cursor,
+            has_more=has_more
+        )
 
 
 @router.post("/chats/{chat_id}/messages")
