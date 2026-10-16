@@ -49,10 +49,7 @@ services:
       - MENO_DATABASE_URL=postgresql+asyncpg://meno_user:meno_password@db:5432/meno_db
       - MENO_REDIS_URL=redis://redis:6379/0
       - MENO_JWT_SECRET=${MENO_JWT_SECRET:-meno-dev-secret}
-      - MENO_SMS_MODE=${MENO_SMS_MODE:-sms_ru}
-      - MENO_SMS_RU_API_KEY=${MENO_SMS_RU_API_KEY}
-      - MENO_SMS_RU_SENDER=${MENO_SMS_RU_SENDER:-MeNo}
-      - MENO_ADMIN_PHONE=${MENO_ADMIN_PHONE}
+      - MENO_ADMIN_USERNAME=${MENO_ADMIN_USERNAME:-owner}
     ports:
       - "8000:8000"
     volumes:

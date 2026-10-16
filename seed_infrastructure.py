@@ -19,7 +19,7 @@ TIMEOUT = 10.0             # Таймаут запроса в секундах
 
 @dataclass
 class UserSession:
-    phone: str
+    username: str
     token: str
     user_id: int
 
@@ -72,8 +72,8 @@ class InfrastructureSeeder:
                 return False
         return True
 
-    def _generate_fake_phone(self):
-        return f"7999{random.randint(1000000, 9999999)}"
+    def _generate_fake_username(self):
+        return f"bench_{random.randint(100000, 999999)}_{''.join(random.choices(string.ascii_lowercase, k=4))}"
 
     async def seed_users(self):
         """2. ГЕНЕРАЦИЯ И НАПОЛНЕНИЕ ПОЛЬЗОВАТЕЛЕЙ."""
@@ -81,32 +81,27 @@ class InfrastructureSeeder:
         
         tasks = []
         for i in range(USER_COUNT):
-            phone = self._generate_fake_phone()
+            username = self._generate_fake_username()
             name = f"User_{i}_{''.join(random.choices(string.ascii_letters, k=4))}"
-            tasks.append(self._create_single_user(phone, name))
+            tasks.append(self._create_single_user(username, name))
         
         await asyncio.gather(*tasks)
         logger.info(f"Successfully created {len(self.sessions)} users.")
 
-    async def _create_single_user(self, phone: str, name: str):
-        # Шаг 1: Запрос кода (проверяем пропускную способность /api/register)
-        res1, _ = await self.safe_request("POST", "/api/register", json={"phone": phone})
-        if not res1: return
-
-        # Шаг 2: Верификация (тестовый код 123456)
+    async def _create_single_user(self, username: str, name: str):
+        # Регистрация без телефона: один запрос /api/register создаёт аккаунт и сессию
         payload = {
-            "phone": phone,
-            "code": "123456", 
+            "username": username,
             "password": "Password123!",
             "display_name": name
         }
-        res2, _ = await self.safe_request("POST", "/api/verify", json=payload)
-        
+        res2, _ = await self.safe_request("POST", "/api/register", json=payload)
+
         if res2:
             data = res2.json()
             token = data["tokens"]["access_token"]
             user_id = data["user"]["id"]
-            self.sessions.append(UserSession(phone, token, user_id))
+            self.sessions.append(UserSession(username, token, user_id))
 
     async def seed_interactions(self):
         """2. Создание графа связей (Чаты и Сообщения)."""

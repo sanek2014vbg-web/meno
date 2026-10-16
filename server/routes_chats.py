@@ -71,14 +71,14 @@ async def search_users(
     q: str = Query(default="", max_length=50),
     user: dict = Depends(get_current_user),
 ):
-    """Поиск пользователей по номеру или имени."""
+    """Поиск пользователей по имени (username) или отображаемому имени."""
     q = q.strip()
     if not q:
         return []
     async with database.get_db() as db:
         rows = await database.aq(
             db,
-            "SELECT * FROM users WHERE (phone LIKE :q OR display_name LIKE :q) AND id != :uid LIMIT 20",
+            "SELECT * FROM users WHERE (username LIKE :q OR display_name LIKE :q) AND id != :uid LIMIT 20",
             {"q": f"%{q}%", "uid": user["id"]},
         )
         return [auth.user_to_public(r) for r in rows]

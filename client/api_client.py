@@ -36,17 +36,17 @@ def _retry_delay(attempt: int) -> float:
 
 
 class ApiClient:
-    def __init__(self, base_url: str = "http://127.0.0.1:8000", phone: str = ""):
+    def __init__(self, base_url: str = "http://127.0.0.1:8000", username: str = ""):
         self.base_url = base_url.rstrip("/")
-        self.phone = phone
+        self.username = username
         self._http: Optional[httpx.AsyncClient] = None
         self.token: Optional[str] = None
         self.refresh_token: Optional[str] = None
         self.user: Optional[dict] = None
         self._create_session()
         # Восстанавливаем токены из изолированного хранилища
-        if phone:
-            tokens = crypto.vault_load_tokens(phone)
+        if username:
+            tokens = crypto.vault_load_tokens(username)
             if tokens:
                 self.token = tokens.get("access")
                 self.refresh_token = tokens.get("refresh")
@@ -59,7 +59,7 @@ class ApiClient:
             follow_redirects=True,
         )
 
-    async def reconfigure(self, base_url: str, phone: str = "") -> None:
+    async def reconfigure(self, base_url: str, username: str = "") -> None:
         """Смена адреса сервера: полностью пересоздаёт базовую сессию."""
         if self._http is not None:
             try:
@@ -67,8 +67,8 @@ class ApiClient:
             except Exception:
                 pass
         self.base_url = base_url.rstrip("/")
-        if phone:
-            self.phone = phone
+        if username:
+            self.username = username
         self.token = None
         self.refresh_token = None
         self.user = None
@@ -101,7 +101,7 @@ class ApiClient:
                     if success:
                         self.token = new_tokens["access_token"]
                         self.refresh_token = new_tokens.get("refresh_token", self.refresh_token)
-                        crypto.vault_save_tokens(self.phone, {
+                        crypto.vault_save_tokens(self.username, {
                             "access": self.token, 
                             "refresh": self.refresh_token
                         })
@@ -113,7 +113,7 @@ class ApiClient:
                         # Обновить не удалось - разлогиниваемся
                         self.token = None
                         self.refresh_token = None
-                        crypto.vault_clear_tokens(self.phone)
+                        crypto.vault_clear_tokens(self.username)
                         raise ApiError(401, "Сессия истекла, пожалуйста, войдите снова")
 
             except httpx.TransportError as exc:
@@ -154,38 +154,35 @@ class ApiClient:
         return False, None
 
     # ---------- Аутентификация ----------
-    async def register(self, phone: str) -> str:
-        """Запросить код подтверждения."""
-        return (await self._req("POST", "/api/register", json={"phone": phone}))["message"]
-
-    async def verify(self, phone: str, code: str, password: str, display_name: str) -> dict:
+    async def register(self, username: str, password: str, display_name: str = "") -> dict:
+        """Регистрация без телефона: username + пароль сразу создают аккаунт и сессию."""
         data = await self._req(
-            "POST", "/api/verify",
-            json={"phone": phone, "code": code, "password": password, "display_name": display_name},
+            "POST", "/api/register",
+            json={"username": username, "password": password, "display_name": display_name},
         )
         # Сервер возвращает {"tokens": {"access_token": "...", "refresh_token": "..."}, "user": {...}}
         tokens = data["tokens"]
         self.token = tokens["access_token"]
         self.refresh_token = tokens["refresh_token"]
         self.user = data["user"]
-        self.phone = phone
-        crypto.vault_save_tokens(phone, {
+        self.username = username
+        crypto.vault_save_tokens(username, {
             "access": self.token, 
             "refresh": self.refresh_token
         })
         return data
 
-    async def login(self, phone: str, password: str, totp: str = "") -> dict:
+    async def login(self, username: str, password: str, totp: str = "") -> dict:
         data = await self._req(
             "POST", "/api/login",
-            json={"phone": phone, "password": password, "totp": totp},
+            json={"username": username, "password": password, "totp": totp},
         )
         tokens = data["tokens"]
         self.token = tokens["access_token"]
         self.refresh_token = tokens["refresh_token"]
         self.user = data["user"]
-        self.phone = phone
-        crypto.vault_save_tokens(phone, {
+        self.username = username
+        crypto.vault_save_tokens(username, {
             "access": self.token, 
             "refresh": self.refresh_token
         })
@@ -201,7 +198,7 @@ class ApiClient:
             pass
         self.token = None
         self.refresh_token = None
-        crypto.vault_clear_tokens(self.phone)
+        crypto.vault_clear_tokens(self.username)
         return {"ok": True}
 
     async def me(self) -> dict:

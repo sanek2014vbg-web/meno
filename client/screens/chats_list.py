@@ -107,9 +107,9 @@ class ChatsList:
             selected=["personal"],
             on_change=lambda e: self._toggle_group(),
         )
-        self.phones = ft.TextField(
-            label="Телефон собеседника (или несколько через запятую для группы)",
-            hint_text="79991234567",
+        self.usernames = ft.TextField(
+            label="Имя пользователя (или несколько через запятую для группы)",
+            hint_text="alice_92",
             width=420,
         )
         self.title_f = ft.TextField(label="Название группы", width=420, visible=False)
@@ -119,7 +119,7 @@ class ChatsList:
             content=ft.Column(
                 width=440,
                 tight=True,
-                controls=[self.seg, self.phones, self.title_f],
+                controls=[self.seg, self.usernames, self.title_f],
             ),
             actions=[
                 ft.TextButton("Отмена", on_click=lambda e: self.page.pop_dialog()),
@@ -132,22 +132,22 @@ class ChatsList:
     def _toggle_group(self):
         group = (self.seg.selected[0] if isinstance(self.seg.selected, list) else self.seg.selected) == "group"
         self.title_f.visible = group
-        self.phones.label = "Телефоны участников через запятую" if group else "Телефон собеседника"
+        self.usernames.label = "Имена участников через запятую" if group else "Имя собеседника"
         self.page.update()
 
     async def _create(self, dlg):
         group = (self.seg.selected[0] if isinstance(self.seg.selected, list) else self.seg.selected) == "group"
-        phones = [p.strip() for p in self.phones.value.split(",") if p.strip()]
-        if not phones:
+        names = [p.strip().lower() for p in self.usernames.value.split(",") if p.strip()]
+        if not names:
             return
         self.page.pop_dialog()
         user_ids = []
         try:
-            for ph in phones:
-                res = await self.app.api.search_users(ph)
-                match = next((u for u in res if u["phone"] == ph), None)
+            for name in names:
+                res = await self.app.api.search_users(name)
+                match = next((u for u in res if u.get("username") == name), None)
                 if not match:
-                    await self.app.toast(f"Пользователь {ph} не найден", error=True)
+                    await self.app.toast(f"Пользователь {name} не найден", error=True)
                     return
                 user_ids.append(match["id"])
             title = self.title_f.value.strip() if group else ""

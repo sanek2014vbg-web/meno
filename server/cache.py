@@ -63,6 +63,16 @@ class Cache:
         except Exception as e:
             logger.error(f"Cache delete error for {key}: {e}")
 
+    async def delete_by_prefix(self, prefix: str):
+        """Удаляет все ключи с указанным префиксом (через scan_iter)."""
+        if not self._redis:
+            return
+        try:
+            async for key in self._redis.scan_iter(match=f"{prefix}*", count=200):
+                await self._redis.delete(key)
+        except Exception as e:
+            logger.error(f"Cache delete_by_prefix error for {prefix}: {e}")
+
     async def close(self):
         """Закрывает соединение."""
         if self._redis:
