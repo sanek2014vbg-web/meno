@@ -7,6 +7,10 @@ DATABASE_URL = os.environ.get("MENO_DATABASE_URL", "postgresql+asyncpg://meno_us
 # --- Redis ---
 REDIS_URL = os.environ.get("MENO_REDIS_URL", "redis://redis:6379/0")
 
+# --- Sentry ---
+# DSN для интеграции с Sentry (получается в панели управления Sentry)
+SENTRY_DSN = os.environ.get("MENO_SENTRY_DSN", "")
+
 # --- JWT ---
 # В продакшене обязательно задать MENO_JWT_SECRET (случайная длинная строка)
 JWT_SECRET = os.environ.get("MENO_JWT_SECRET", "meno-dev-secret-change-me")

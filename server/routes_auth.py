@@ -13,6 +13,7 @@ from deps import get_current_user
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 from datetime import datetime, timedelta
+from typing import Dict, Any
 
 import push as push_service
 from rate_limit import auth_key, limiter
@@ -21,38 +22,57 @@ router = APIRouter(prefix="/api", tags=["auth"])
 
 PHONE_PATTERN = r"^\d{10,15}$"
 
+# --- Схемы запросов и ответов ---
+
 class PhoneRequest(BaseModel):
-    phone: str = Field(..., pattern=PHONE_PATTERN, description="Номер в формате 79991234567")
+    phone: str = Field(..., pattern=PHONE_PATTERN, description="Номер телефона в международном формате (например, 79991234567)")
 
 class VerifyRequest(BaseModel):
     phone: str = Field(..., pattern=PHONE_PATTERN)
-    code: str = Field(..., min_length=6, max_length=6)
-    password: str = Field(..., min_length=4, max_length=128)
-    display_name: str = Field(default="", max_length=50)
+    code: str = Field(..., min_length=6, max_//C-length=6, description="6-значный код подтверждения")
+    password: str = Field(..., min_length=4, max_length=128, description="Пароль для создания аккаунта")
+    display_name: str = Field(default="", max_length=50, description="Имя пользователя")
 
 class LoginRequest(BaseModel):
     phone: str = Field(..., pattern=PHONE_PATTERN)
     password: str = Field(..., max_length=128)
-    totp: str = Field(default="", max_length=6)
+    totp: str = Field(default="", max_length=6, description="Код 2FA, если включено")
 
 class RefreshRequest(BaseModel):
-    refresh_token: str = Field(..., min_length=32)
+    refresh_token: str = Field(..., min_length=32, description="Долгоживущий токен обновления")
 
 class TotpSetupRequest(BaseModel):
     totp: str = Field(..., min_length=6, max_length=6)
 
 class E2EKeyRequest(BaseModel):
-    public_key: str = Field(..., min_length=32, max_length=512)
+    public_key: str = Field(..., min_length=32, max_length=512, description="Публичный ключ X25519 (base64)")
 
 class PushTokenRequest(BaseModel):
     token: str = Field(..., min_length=20, max_length=512)
     platform: str = Field(default="android", pattern="^(android|ios|web)$")
 
+class TokenResponse(BaseModel):
+    access_token: str = Field(..., description="Краткосрочный токен доступа (Bearer)")
+    refresh_token: str = Field(..., description="Долгосрочный токен для обновления сессии")
+
+class UserResponse(BaseModel):
+    id: int
+    phone: str
+    display_name: str
+    role: str
+    avatar_path: Optional[str]
+    last_seen: Optional[str]
+    twofa_enabled: bool
+    e2e_pub: Optional[str]
+
+class AuthResponse(BaseModel):
+    tokens: TokenResponse
+    user: UserResponse
+
 def _public(user: dict) -> dict:
     return auth.user_to_public(user)
 
 async def _issue_tokens(user_id: int, db):
-    """Вспомогательная функция для выдачи пары токенов."""
     access = auth.create_access_token(user_id)
     refresh = auth.create_refresh_token(user_id)
     
@@ -63,7 +83,13 @@ async def _issue_tokens(user_id: int, db):
     )
     return {"access_token": access, "refresh_token": refresh}
 
-@router.post("/register")
+@router.post(
+    "/register", 
+    response_model=Dict[str, Any],
+    summary="Запрос кода регистрации",
+    description="Отправляет код подтверждения на телефон пользователя. Ограничено rate-лимитом.",
+    responses={429: {"description": "Too Many Requests"}, 400: {"description": "Account already exists"}}
+)
 async def request_register(body: PhoneRequest, request: Request):
     phone = body.phone.strip()
     if not limiter.allow(auth_key("register", request, phone), config.RL_REGISTER_LIMIT, config.RL_REGISTER_WINDOW):
@@ -75,7 +101,13 @@ async def request_register(body: PhoneRequest, request: Request):
         raise HTTPException(429, msg)
     return {"ok": True, "message": msg}
 
-@router.post("/verify")
+@router.post(
+    "/verify", 
+    response_model=AuthResponse,
+    summary="Подтверждение кода и создание аккаунта",
+    description="Проверяет код из SMS и создает пользователя в системе.",
+    responses={400: {"description": "Invalid code or account exists"}}
+)
 async def verify_and_create(body: VerifyRequest, request: Request):
     phone = body.phone.strip()
     if not limiter.allow(auth_key("verify", request, phone), config.RL_VERIFY_LIMIT, config.RL_VERIFY_WINDOW):
@@ -96,7 +128,13 @@ async def verify_and_create(body: VerifyRequest, request: Request):
 
     return {"tokens": tokens, "user": _public(user)}
 
-@router.post("/login")
+@router.post(
+    "/login", 
+    response_model=AuthResponse,
+    summary="Вход в аккаунт",
+    description="Авторизация по номеру и паролю. Если включена 2FA, требуется код TOTP.",
+    responses={400: {"description": "Invalid credentials or 2FA required"}}
+)
 async def login(body: LoginRequest, request: Request):
     phone = body.phone.strip()
     key = auth_key("login", request, phone)
@@ -117,9 +155,14 @@ async def login(body: LoginRequest, request: Request):
         
     return {"tokens": tokens, "user": _public(user)}
 
-@router.post("/refresh")
+@router.post(
+    "/refresh", 
+    response_model=Dict[str, str],
+    summary="Обновление Access-токена",
+    description="Позволяет получить новый краткосрочный токен доступа, используя Refresh-токен.",
+    responses={401: {"description": "Invalid or expired refresh token"}}
+)
 async def refresh_token(body: RefreshRequest):
-    """Обновление Access токена с помощью Refresh токена."""
     async with database.get_db() as db:
         token_data = await database.aq1(
             db, 
@@ -130,39 +173,67 @@ async def refresh_token(body: RefreshRequest):
             raise HTTPException(401, "Refresh token недействителен или просрочен")
         
         user_id = token_data["user_id"]
-        # Выдаем новый access токен
         new_access = auth.create_access_token(user_id)
         return {"access_token": new_access}
 
-@router.post("/logout")
+@router.post(
+    "/logout", 
+    summary="Выход из системы",
+    description="Инвалидирует текущую сессию (удаляет Refresh-токен из БД).",
+    responses={200: {"description": "Logged out successfully"}}
+)
 async def logout(body: RefreshRequest, user: dict = Depends(get_current_user)):
-    """Инвалидация сессии (удаление Refresh токена)."""
     async with database.get_db() as db:
         await db.execute("DELETE FROM refresh_tokens WHERE token=:t AND user_id=:uid", 
                          {"t": body.refresh_token, "uid": user["id"]})
     return {"ok": True}
 
-@router.get("/me")
+@router.get(
+    "/me", 
+    response_model=UserResponse,
+    summary="Данные текущего пользователя",
+    description="Возвращает публичный профиль авторизованного пользователя."
+)
 async def me(user: dict = Depends(get_current_user)):
     return _public(user)
 
-@router.put("/me/e2e-key")
+@router.put(
+    "/me/e2e-key", 
+    summary="Установка E2E-ключа",
+    description="Регистрирует публичный ключ X25519 пользователя для шифрования личных чатов."
+)
 async def set_e2e_key(body: E2EKeyRequest, user: dict = Depends(get_current_user)):
     async with database.get_db() as db:
         await db.execute("UPDATE users SET e2e_pub=:key WHERE id=:id", {"key": body.public_key.strip(), "id": user["id"]})
     return {"ok": True}
 
-@router.post("/me/push-token")
+class PushTokenRequest(BaseModel):
+    token: str = Field(..., min_length=20, max_length=512)
+    platform: str = Field(default="android", pattern="^(android|ios|web)$")
+
+@router.post(
+    "/me/push-token", 
+    summary="Регистрация Push-токена",
+    description="Привязывает токен устройства (FCM) к аккаунту для отправки уведомлений."
+)
 async def set_push_token(body: PushTokenRequest, user: dict = Depends(get_current_user)):
     push_service.register_token(user["id"], body.token, body.platform)
     return {"ok": True}
 
-@router.delete("/me/push-token")
-async def remove_push_token(body: PushTokenRequest, user: dict = Depends(get_current_user)):
+@router.delete(
+    "/me/push-token", 
+    summary="Отвязка Push-токена",
+    description="Удаляет токен устройства при выходе из аккаунта."
+)
+async def remove_push_token(body: PushTokenRequest, user: dict = Depends(get_//C-current_user)):
     push_service.unregister_token(user["id"], body.token)
     return {"ok": True}
 
-@router.get("/users/{user_id}/e2e-key")
+@router.get(
+    "/users/{user_id}/e2e-key", 
+    summary="Получение E2E-ключа пользователя",
+    description="Возвращает публичный ключ другого пользователя для вычисления общего секрета."
+)
 async def get_e2e_key(user_id: int, user: dict = Depends(get_current_user)):
     target = await auth.get_user_by_id(user_id)
     if not target:
@@ -171,7 +242,12 @@ async def get_e2e_key(user_id: int, user: dict = Depends(get_current_user)):
         raise HTTPException(404, "Пользователь ещё не активировал E2E")
     return {"user_id": user_id, "public_key": target["e2e_pub"]}
 
-@router.post("/me/totp/setup")
+@router.post(
+    "/me/totp/setup", 
+    summary="Настройка 2FA",
+    description="Генерирует секрет TOTP и URI для QR-кода (доступно только админу).",
+    responses={403: {"description": "Forbidden - Admin only"}}
+)
 async def totp_setup(user: dict = Depends(get_current_user)):
     if user["role"] != "admin":
         raise HTTPException(403, "2FA доступна владельцу")
@@ -180,7 +256,12 @@ async def totp_setup(user: dict = Depends(get_current_user)):
         await db.execute("UPDATE users SET totp_secret=:secret WHERE id=:id", {"secret": secret, "id": user["id"]})
     return {"secret": secret, "uri": auth.totp_provisioning_uri(secret, user["phone"])}
 
-@router.post("/me/totp/enable")
+@router.post(
+    "/me/totp/enable", 
+    summary="Активация 2FA",
+    description="Активирует 2FA после проверки первого корректного кода из приложения.",
+    responses={400: {"description": "Invalid code"}}
+)
 async def totp_enable(body: TotpSetupRequest, user: dict = Depends(get_current_user)):
     if user["role"] != "admin":
         raise HTTPException(403, "2FA доступна владельцу")
@@ -192,7 +273,12 @@ async def totp_enable(body: TotpSetupRequest, user: dict = Depends(get_current_u
         await db.execute("UPDATE users SET twofa_enabled=1 WHERE id=:id", {"id": user["id"]})
     return {"ok": True, "message": "2FA включена"}
 
-@router.post("/me/totp/disable")
+@router.post(
+    "/me/totp/disable", 
+    summary="Отключение 2FA",
+    description="Отключает 2FA после проверки текущего кода.",
+    responses={400: {"description": "Invalid code"}}
+)
 async def totp_disable(body: TotpSetupRequest, user: dict = Depends(get_current_user)):
     if user["role"] != "admin":
         raise HTTPException(403, "2FA доступна владельцу")
