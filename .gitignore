@@ -5,18 +5,24 @@ __pycache__/
 .venv/
 venv/
 
-# Данные и медиа
-meno/server/meno.db
-meno/server/uploads/
-meno/server/dev_keys.json
-
-# Локальные настройки
+# Environment and Secrets
 .env
 *.local
+*.pem
+*.key
 
-# IDE
+# Data and Media
+server/uploads/
+server/meno.db
+server/dev_keys.json
+
+# IDEs
 .vscode/
 .idea/
 
-# Сборка Flet
-meno/client/build/
+# Build and Logs
+server/server.log
+app.log
+client/build/
+dist/
+build/
