@@ -27,13 +27,13 @@ class MarkViewedRequest(BaseModel):
     pass
 
 
-def _serialize(db, m: dict) -> dict:
-    sender = database.q1(db, "SELECT display_name FROM users WHERE id=?", (m["sender_id"],))
+def _serialize_msg(m: dict) -> dict:
+    """Превращает строку из БД в API-ответ. Данные отправителя уже должны быть в m."""
     return {
         "id": m["id"],
         "chat_id": m["chat_id"],
         "sender_id": m["sender_id"],
-        "sender_name": sender["display_name"] if sender else "",
+        "sender_name": m.get("sender_name", ""),
         "type": m["type"],
         "content": m["content"],
         "media_path": m["media_path"],
@@ -46,7 +46,7 @@ def _serialize(db, m: dict) -> dict:
 
 
 @router.get("/chats/{chat_id}/messages")
-def list_messages(
+async def list_messages(
     chat_id: int,
     limit: int = 50,
     before_id: Optional[int] = None,
@@ -54,73 +54,85 @@ def list_messages(
 ):
     if limit > 200:
         limit = 200
-    with database.get_db() as db:
-        if not is_chat_member(chat_id, user["id"]):
+    async with database.get_db() as db:
+        if not await is_chat_member(chat_id, user["id"]):
             raise HTTPException(403, "Вы не участник этого чата")
+        
+        # ОПТИМИЗАЦИЯ: Используем JOIN для получения имен отправителей одним запросом.
+        # Решаем проблему N+1.
+        sql = (
+            "SELECT m.*, u.display_name AS sender_name "
+            "FROM messages m "
+            "JOIN users u ON u.id = m.sender_id "
+            "WHERE m.chat_id = :chat_id "
+        )
+        params = {"chat_id": chat_id}
+        
         if before_id:
-            rows = database.q(
-                db,
-                "SELECT * FROM messages WHERE chat_id=? AND id<? "
-                "ORDER BY id DESC LIMIT ?",
-                (chat_id, before_id, limit),
-            )
+            sql += " AND m.id < :before_id ORDER BY m.id DESC LIMIT :limit"
+            params.update({"before_id": before_id, "limit": limit})
         else:
-            rows = database.q(
-                db,
-                "SELECT * FROM messages WHERE chat_id=? ORDER BY id DESC LIMIT ?",
-                (chat_id, limit),
-            )
-        # Возвращаем в хронологическом порядке
-        return [_serialize(db, m) for m in reversed(rows)]
+            sql += " ORDER BY m.id DESC LIMIT :limit"
+            params.update({"limit": limit})
+            
+        rows = await database.aq(db, sql, params)
+        
+        return [_serialize_msg(m) for m in reversed(rows)]
 
 
 @router.post("/chats/{chat_id}/messages")
 async def send_message(
     chat_id: int, body: SendMessageRequest, user: dict = Depends(get_current_user)
 ):
-    with database.get_db() as db:
-        if not is_chat_member(chat_id, user["id"]):
+    async with database.get_db() as db:
+        if not await is_chat_member(chat_id, user["id"]):
             raise HTTPException(403, "Вы не участник этого чата")
 
-        # Антиспам: не более N сообщений в минуту
+        # Антиспам
         minute_ago = (datetime.utcnow() - timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M:%S")
-        cnt = database.q1(
+        res = await database.aq1(
             db,
-            "SELECT COUNT(*) AS c FROM messages WHERE sender_id=? AND created_at > ?",
-            (user["id"], minute_ago),
-        )["c"]
-        if cnt >= config.SPAM_MSG_PER_MINUTE:
+            "SELECT COUNT(*) AS c FROM messages WHERE sender_id=:uid AND created_at > :time",
+            {"uid": user["id"], "time": minute_ago},
+        )
+        if res and res["c"] >= config.SPAM_MSG_PER_MINUTE:
             raise HTTPException(429, "Слишком часто отправляете сообщения")
 
         if not body.content and not body.media_path:
             raise HTTPException(400, "Пустое сообщение")
 
-        cur = db.execute(
+        await db.execute(
             "INSERT INTO messages (chat_id, sender_id, type, content, media_path, ttl_seconds, view_once, e2e) "
-            "VALUES (?,?,?,?,?,?,?,?)",
-            (
-                chat_id,
-                user["id"],
-                body.type,
-                body.content.strip(),
-                body.media_path,
-                body.ttl_seconds,
-                1 if body.view_once else 0,
-                1 if body.e2e else 0,
-            ),
+            "VALUES (:chat_id, :sender_id, :type, :content, :media_path, :ttl, :view_once, :e2e)",
+            {
+                "chat_id": chat_id,
+                "sender_id": user["id"],
+                "type": body.type,
+                "content": body.content.strip(),
+                "media_path": body.media_path,
+                "ttl": body.ttl_seconds,
+                "view_once": 1 if body.view_once else 0,
+                "e2e": 1 if body.e2e else 0,
+            },
         )
-        msg = database.q1(db, "SELECT * FROM messages WHERE id=?", (cur.lastrowid,))
-        payload = {"type": "new_message", "message": _serialize(db, msg)}
+        # Получаем сообщение вместе с именем отправителя для WebSocket-payload
+        msg = await database.aq1(
+            db, 
+            "SELECT m.*, u.display_name AS sender_name FROM messages m "
+            "JOIN users u ON u.id = m.sender_id "
+            "WHERE m.id = (SELECT max(id) FROM messages WHERE chat_id=:cid AND sender_id=:sid)", 
+            {"cid": chat_id, "sid": user["id"]}
+        )
+        payload = {"type": "new_message", "message": _serialize_msg(msg)}
 
-    members = _chat_member_ids(chat_id)
+    members = await _chat_member_ids(chat_id)
     await manager.send_to_users(members, payload)
 
-    # Фоновые push для участников, которые сейчас НЕ в сети (WebSocket закрыт).
-    # Для E2E-сообщений текст не раскрывается — только метка.
+    # Фоновые push
     try:
-        with database.get_db() as db_push:
-            sender_row = database.q1(
-                db_push, "SELECT display_name FROM users WHERE id=?", (user["id"],)
+        async with database.get_db() as db_push:
+            sender_row = await database.aq1(
+                db_push, "SELECT display_name FROM users WHERE id=:id", {"id": user["id"]}
             )
             sender_label = (sender_row or {}).get("display_name") or "Собеседник"
         for uid in members:
@@ -140,25 +152,23 @@ async def send_message(
                     {"chat_id": str(chat_id), "message_id": str(msg["id"])},
                 )
     except Exception:
-        pass  # push не критичен для доставки сообщения
+        pass
 
     return payload["message"]
 
 
 @router.post("/messages/{message_id}/view")
 async def mark_viewed(message_id: int, user: dict = Depends(get_current_user)):
-    """Отметить сообщение просмотренным (для view_once)."""
-    with database.get_db() as db:
-        m = database.q1(db, "SELECT * FROM messages WHERE id=?", (message_id,))
+    async with database.get_db() as db:
+        m = await database.aq1(db, "SELECT * FROM messages WHERE id=:id", {"id": message_id})
         if not m:
             raise HTTPException(404, "Сообщение не найдено")
-        if not is_chat_member(m["chat_id"], user["id"]):
+        if not await is_chat_member(m["chat_id"], user["id"]):
             raise HTTPException(403, "Нет доступа")
         if m["view_once"] and not m["viewed"]:
-            db.execute("UPDATE messages SET viewed=1 WHERE id=?", (message_id,))
-            m = database.q1(db, "SELECT * FROM messages WHERE id=?", (message_id,))
+            await db.execute("UPDATE messages SET viewed=1 WHERE id=:id", {"id": message_id})
+            m = await database.aq1(db, "SELECT * FROM messages WHERE id=:id", {"id": message_id})
 
-    # Уведомляем отправителя, что сообщение просмотрено
     payload = {"type": "message_viewed", "message_id": message_id, "chat_id": m["chat_id"]}
     await manager.send_to_user(m["sender_id"], payload)
     return {"ok": True}
@@ -166,15 +176,15 @@ async def mark_viewed(message_id: int, user: dict = Depends(get_current_user)):
 
 @router.delete("/messages/{message_id}")
 async def delete_message(message_id: int, user: dict = Depends(get_current_user)):
-    with database.get_db() as db:
-        m = database.q1(db, "SELECT * FROM messages WHERE id=?", (message_id,))
+    async with database.get_db() as db:
+        m = await database.aq1(db, "SELECT * FROM messages WHERE id=:id", {"id": message_id})
         if not m:
             raise HTTPException(404, "Сообщение не найдено")
         if m["sender_id"] != user["id"]:
             raise HTTPException(403, "Удалять можно только свои сообщения")
-        db.execute("DELETE FROM messages WHERE id=?", (message_id,))
+        await db.execute("DELETE FROM messages WHERE id=:id", {"id": message_id})
 
-    members = _chat_member_ids(m["chat_id"])
+    members = await _chat_member_ids(m["chat_id"])
     await manager.send_to_users(
         members, {"type": "message_deleted", "message_id": message_id, "chat_id": m["chat_id"]}
     )
@@ -187,31 +197,30 @@ class ReportRequest(BaseModel):
 
 
 @router.post("/reports")
-def report_message(body: ReportRequest, user: dict = Depends(get_current_user)):
-    """Жалоба на сообщение (идёт в очередь модерации DevMode)."""
-    with database.get_db() as db:
-        m = database.q1(db, "SELECT * FROM messages WHERE id=?", (body.message_id,))
+async def report_message(body: ReportRequest, user: dict = Depends(get_current_user)):
+    async with database.get_db() as db:
+        m = await database.aq1(db, "SELECT * FROM messages WHERE id=:id", {"id": body.message_id})
         if not m:
             raise HTTPException(404, "Сообщение не найдено")
-        if not is_chat_member(m["chat_id"], user["id"]):
+        if not await is_chat_member(m["chat_id"], user["id"]):
             raise HTTPException(403, "Вы не участник этого чата")
         if m["sender_id"] == user["id"]:
             raise HTTPException(400, "Нельзя пожаловаться на своё сообщение")
-        already = database.q1(
+        already = await database.aq1(
             db,
-            "SELECT id FROM reports WHERE message_id=? AND reporter_id=? AND status='open'",
-            (body.message_id, user["id"]),
+            "SELECT id FROM reports WHERE message_id=:mid AND reporter_id=:uid AND status='open'",
+            {"mid": body.message_id, "uid": user["id"]},
         )
         if already:
             raise HTTPException(400, "Вы уже пожаловались на это сообщение")
-        db.execute(
-            "INSERT INTO reports (chat_id, message_id, reporter_id, reason) VALUES (?,?,?,?)",
-            (m["chat_id"], m["id"], user["id"], body.reason.strip()),
+        await db.execute(
+            "INSERT INTO reports (chat_id, message_id, reporter_id, reason) VALUES (:cid, :mid, :uid, :reason)",
+            {"cid": m["chat_id"], "mid": m["id"], "uid": user["id"], "reason": body.reason.strip()},
         )
     return {"ok": True, "message": "Жалоба отправлена модератору"}
 
 
-def _chat_member_ids(chat_id: int) -> list:
-    with database.get_db() as db:
-        rows = database.q(db, "SELECT user_id FROM chat_members WHERE chat_id=?", (chat_id,))
+async def _chat_member_ids(chat_id: int) -> list:
+    async with database.get_db() as db:
+        rows = await database.aq(db, "SELECT user_id FROM chat_members WHERE chat_id=:cid", {"cid": chat_id})
     return [r["user_id"] for r in rows]

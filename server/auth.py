@@ -8,7 +8,7 @@ import pyotp
 
 import config
 import database
-
+from server.cache import cache
 
 # ---------- Пароли ----------
 def hash_password(password: str) -> str:
@@ -23,18 +23,30 @@ def check_password(password: str, password_hash: str) -> bool:
 
 
 # ---------- JWT ----------
-def create_token(user_id: int) -> str:
+# Короткоживущий токен доступа (15 минут)
+ACCESS_TOKEN_EXPIRE_MINUTES = 15
+# Долгоживущий токен обновления (7 дней)
+REFRESH_TOKEN_EXPIRE_DAYS = 7
+
+def create_access_token(user_id: int) -> str:
     payload = {
         "sub": str(user_id),
-        "exp": datetime.utcnow() + timedelta(days=config.JWT_EXPIRE_DAYS),
+        "exp": datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
+        "type": "access"
     }
     return jwt.encode(payload, config.JWT_SECRET, algorithm=config.JWT_ALGO)
 
+def create_refresh_token(user_id: int) -> str:
+    # Refresh token может быть просто случайной длинной строкой (opaque token)
+    # Это безопаснее, так как мы храним его в БД и можем мгновенно отозвать.
+    return secrets.token_urlsafe(64)
 
 def decode_token(token: str) -> Optional[int]:
     """Возвращает user_id по токену или None."""
     try:
         data = jwt.decode(token, config.JWT_SECRET, algorithms=[config.JWT_ALGO])
+        if data.get("type") != "access":
+            return None
         return int(data["sub"])
     except (jwt.PyJWTError, KeyError, ValueError):
         return None
@@ -57,22 +69,40 @@ def verify_totp(secret: str, code: str) -> bool:
         return False
 
 
-# ---------- Пользователи ----------
-def get_user_by_id(user_id: int) -> Optional[dict]:
-    with database.get_db() as db:
-        return database.q1(db, "SELECT * FROM users WHERE id=?", (user_id,))
+# ---------- Пользователи (с кешированием) ----------
+async def get_user_by_id(user_id: int) -> Optional[dict]:
+    cache_key = f"user:id:{user_id}"
+    cached = await cache.get(cache_key)
+    if cached:
+        return cached
+
+    async with database.get_db() as db:
+        user = await database.aq1(db, "SELECT * FROM users WHERE id=:id", {"id": user_id})
+        if user:
+            await cache.set(cache_key, user, ttl=300) # кешируем на 5 минут
+        return user
 
 
-def get_user_by_phone(phone: str) -> Optional[dict]:
-    with database.get_db() as db:
-        return database.q1(db, "SELECT * FROM users WHERE phone=?", (phone,))
+async def get_user_by_phone(phone: str) -> Optional[dict]:
+    cache_key = f"user:phone:{phone}"
+    cached = await cache.get(cache_key)
+    if cached:
+        return cached
+
+    async with database.get_db() as db:
+        user = await database.aq1(db, "SELECT * FROM users WHERE phone=:phone", {"phone": phone})
+        if user:
+            await cache.set(cache_key, user, ttl=300)
+        return user
 
 
-def touch_last_seen(user_id: int) -> None:
-    with database.get_db() as db:
-        db.execute(
-            "UPDATE users SET last_seen=datetime('now') WHERE id=?", (user_id,)
+async def touch_last_seen(user_id: int) -> None:
+    async with database.get_db() as db:
+        await db.execute(
+            "UPDATE users SET last_seen=CURRENT_TIMESTAMP WHERE id=:id", {"id": user_id}
         )
+        # Инвалидируем кеш профиля, так как last_seen изменился
+        await cache.delete(f"user:id:{user_id}")
 
 
 def user_to_public(u: dict) -> dict:

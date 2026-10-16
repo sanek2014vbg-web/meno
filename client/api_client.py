@@ -2,14 +2,13 @@
 
 Боевые свойства:
 - автоматические повторные попытки (Retries) с экспоненциальной
-  задержкой при обрыве интернета: 1s, 2s, 4s — для всех HTTP-запросов,
-  включая загрузку файлов;
-- WebSocket: авто-переподключение при потере соединения с
-  экспоненциальным ожиданием и колбэком статуса для шапки приложения;
-- динамическая смена адреса сервера: reconfigure() пересоздаёт
-  базовую HTTP-сессию, клиент не привязан к localhost со старта;
+  задержкой при обрыве интернета: 1s, 2s, 4s;
+- WebSocket: авто-переподключение при потере соединения;
+- динамическая смена адреса сервера: reconfigure();
 - токены авторизации сохраняются в изолированном зашифрованном
   хранилище (crypto.vault_*) и восстанавливаются при создании клиента.
+- Автоматическое обновление токена (Token Rotation): при 401 ошибке
+  клиент пытается обновить Access-токен через Refresh-токен.
 """
 import asyncio
 import json
@@ -42,13 +41,15 @@ class ApiClient:
         self.phone = phone
         self._http: Optional[httpx.AsyncClient] = None
         self.token: Optional[str] = None
+        self.refresh_token: Optional[str] = None
         self.user: Optional[dict] = None
         self._create_session()
-        # Восстанавливаем токен из изолированного хранилища
+        # Восстанавливаем токены из изолированного хранилища
         if phone:
-            saved = crypto.vault_load_token(phone)
-            if saved:
-                self.token = saved
+            tokens = crypto.vault_load_tokens(phone)
+            if tokens:
+                self.token = tokens.get("access")
+                self.refresh_token = tokens.get("refresh")
 
     # ---------- Управление сессией ----------
     def _create_session(self) -> None:
@@ -59,12 +60,7 @@ class ApiClient:
         )
 
     async def reconfigure(self, base_url: str, phone: str = "") -> None:
-        """Смена адреса сервера: полностью пересоздаёт базовую сессию.
-
-        Старая сессия закрывается, чтобы клиент не остался привязанным
-        к прежнему адресу (например, localhost, зашитый на старте).
-        Токен и пользователь сбрасываются — требуется новый вход.
-        """
+        """Смена адреса сервера: полностью пересоздаёт базовую сессию."""
         if self._http is not None:
             try:
                 await self._http.aclose()
@@ -74,6 +70,7 @@ class ApiClient:
         if phone:
             self.phone = phone
         self.token = None
+        self.refresh_token = None
         self.user = None
         self._create_session()
 
@@ -89,20 +86,43 @@ class ApiClient:
         return {"Authorization": f"Bearer {self.token}"} if self.token else {}
 
     async def _req(self, method: str, path: str, **kw) -> dict:
-        """HTTP-запрос с ретраями при обрыве сети и ошибках 5xx."""
+        """HTTP-запрос с ретраями и автоматическим обновлением токена."""
         r: Optional[httpx.Response] = None
+        
         for attempt in range(MAX_RETRIES + 1):
             try:
                 r = await self._http.request(
                     method, self.base_url + path, headers=self._headers(), **kw
                 )
+                
+                # Если получили 401 (Unauthorized), пробуем обновить токен один раз
+                if r.status_code == 401 and self.refresh_token:
+                    success, new_tokens = await self._try_refresh_token()
+                    if success:
+                        self.token = new_tokens["access_token"]
+                        self.refresh_token = new_tokens.get("refresh_token", self.refresh_token)
+                        crypto.vault_save_tokens(self.phone, {
+                            "access": self.token, 
+                            "refresh": self.refresh_token
+                        })
+                        # Повторяем запрос с новым токеном
+                        r = await self._http.request(
+                            method, self.base_url + path, headers=self._headers(), **kw
+                        )
+                    else:
+                        # Обновить не удалось - разлогиниваемся
+                        self.token = None
+                        self.refresh_token = None
+                        crypto.vault_clear_tokens(self.phone)
+                        raise ApiError(401, "Сессия истекла, пожалуйста, войдите снова")
+
             except httpx.TransportError as exc:
                 if attempt < MAX_RETRIES:
                     await asyncio.sleep(_retry_delay(attempt))
                     continue
                 raise ApiError(0, f"Нет соединения с сервером ({exc.__class__.__name__})")
-            # 502/503/504 — сервер временно недоступен, пробуем ещё раз
-            if r.status_code in (502, 503, 504) and attempt < MAX_RETRIES:
+            
+            if r and r.status_code in (502, 503, 504) and attempt < MAX_RETRIES:
                 await asyncio.sleep(_retry_delay(attempt))
                 continue
             break
@@ -116,6 +136,23 @@ class ApiClient:
             raise ApiError(r.status_code, str(detail))
         return r.json() if r.content else {}
 
+    async def _try_refresh_token(self) -> tuple[bool, Optional[dict]]:
+        """Пытается обновить Access токен через Refresh токен."""
+        try:
+            # Используем внутренний httpx запрос, чтобы не попасть в рекурсию _req
+            resp = await self._http.post(
+                self.base_url + "/api/refresh",
+                json={"refresh_token": self.refresh_token},
+                timeout=10.0
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                # Сервер возвращает {"access_token": "..."}
+                return True, {"access_token": data["access_token"]}
+        except Exception:
+            pass
+        return False, None
+
     # ---------- Аутентификация ----------
     async def register(self, phone: str) -> str:
         """Запросить код подтверждения."""
@@ -126,10 +163,16 @@ class ApiClient:
             "POST", "/api/verify",
             json={"phone": phone, "code": code, "password": password, "display_name": display_name},
         )
-        self.token = data["token"]
+        # Сервер возвращает {"tokens": {"access_token": "...", "refresh_token": "..."}, "user": {...}}
+        tokens = data["tokens"]
+        self.token = tokens["access_token"]
+        self.refresh_token = tokens["refresh_token"]
         self.user = data["user"]
         self.phone = phone
-        crypto.vault_save_token(phone, data["token"])  # изолированное хранилище
+        crypto.vault_save_tokens(phone, {
+            "access": self.token, 
+            "refresh": self.refresh_token
+        })
         return data
 
     async def login(self, phone: str, password: str, totp: str = "") -> dict:
@@ -137,11 +180,29 @@ class ApiClient:
             "POST", "/api/login",
             json={"phone": phone, "password": password, "totp": totp},
         )
-        self.token = data["token"]
+        tokens = data["tokens"]
+        self.token = tokens["access_token"]
+        self.refresh_token = tokens["refresh_token"]
         self.user = data["user"]
         self.phone = phone
-        crypto.vault_save_token(phone, data["token"])  # изолированное хранилище
+        crypto.vault_save_tokens(phone, {
+            "access": self.token, 
+            "refresh": self.refresh_token
+        })
         return data
+
+    async def logout(self) -> dict:
+        """Выход из аккаунта с инвалидацией Refresh токена на сервере."""
+        if not self.refresh_token:
+            return {"ok": True}
+        try:
+            await self._req("POST", "/api/logout", json={"refresh_token": self.refresh_token})
+        except Exception:
+            pass
+        self.token = None
+        self.refresh_token = None
+        crypto.vault_clear_tokens(self.phone)
+        return {"ok": True}
 
     async def me(self) -> dict:
         self.user = await self._req("GET", "/api/me")
@@ -192,8 +253,6 @@ class ApiClient:
         media_path: str = "",
         e2e: bool = False,
     ) -> dict:
-        """Отправляет сообщение. При e2e=True сервер хранит шифротекст
-        (контент зашифрован клиентом до отправки)."""
         return await self._req(
             "POST", f"/api/chats/{chat_id}/messages",
             json={
@@ -214,11 +273,9 @@ class ApiClient:
 
     # ---------- E2E-ключи ----------
     async def e2e_set_key(self, public_key: str) -> dict:
-        """Регистрирует публичный ключ X25519 на сервере."""
         return await self._req("PUT", "/api/me/e2e-key", json={"public_key": public_key})
 
     async def e2e_get_key(self, user_id: int) -> str:
-        """Возвращает публичный ключ пользователя для общего секрета чата."""
         data = await self._req("GET", f"/api/users/{user_id}/e2e-key")
         return data["public_key"]
 
@@ -229,7 +286,6 @@ class ApiClient:
 
     # ---------- Файлы ----------
     async def upload(self, file_path: str) -> str:
-        """Загрузка файла с ретраями (файл перечитывается при каждой попытке)."""
         filename = file_path.split("\\")[-1].split("/")[-1]
         r: Optional[httpx.Response] = None
         for attempt in range(MAX_RETRIES + 1):
@@ -246,7 +302,7 @@ class ApiClient:
                     continue
                 raise ApiError(0, f"Нет соединения с сервером ({exc.__class__.__name__})")
             if r.status_code in (502, 503, 504) and attempt < MAX_RETRIES:
-                await asyncio.sleep(_retry_delay(attempt))
+                await asyncio.sleep(_retry_//_retry_delay(attempt))
                 continue
             break
 
@@ -280,7 +336,7 @@ class ApiClient:
 
     async def admin_set_setting(self, key: str, value: str) -> dict:
         return await self._req(
-            "PUT", "/api/admin/settings", json={"key": key, "value": value}
+            "PUT", "/api/admin/settings", json={"key": key, "value": value},
         )
 
     # ---------- WebSocket ----------
@@ -289,24 +345,12 @@ class ApiClient:
         on_event: Callable[[dict], Awaitable[None]],
         on_status: Optional[Callable[[bool], None]] = None,
     ):
-        """Слушает события сервера в реальном времени.
-
-        При обрыве соединения автоматически переподключается с
-        экспоненциальной задержкой (1s → 2s → 4s → … до 30s).
-        on_status(True) — соединение установлено, on_status(False) —
-        потеряно/переподключение. Это позволяет мягко показывать
-        «Подключение…» в шапке приложения, не блокируя UI.
-        """
         import websockets
 
-        # Токен передаём заголовком, а не query-параметром: он не попадает
-        # в URL и в логи сервера/nginx (санитизация server.log).
         uri = self.base_url.replace("http", "ws") + "/ws"
         auth_headers = {"Authorization": f"Bearer {self.token}"} if self.token else {}
         ws_kwargs = dict(ping_interval=20, ping_timeout=20, close_timeout=5,
                          max_size=4 * 1024 * 1024)
-        # Совместимость с разными версиями библиотеки websockets:
-        # >=13 — additional_headers, старые — extra_headers.
         try:
             ws_version = int(str(getattr(websockets, "__version__", "0")).split(".")[0])
         except Exception:
@@ -320,7 +364,7 @@ class ApiClient:
         while True:
             try:
                 async with websockets.connect(uri, **ws_kwargs) as ws:
-                    delay = 1.0  # успешное подключение — сбрасываем задержку
+                    delay = 1.0
                     if on_status:
                         try:
                             on_status(True)
@@ -330,16 +374,16 @@ class ApiClient:
                         try:
                             msg = json.loads(await ws.recv())
                         except Exception:
-                            break  # обрыв канала — выходим на переподключение
+                            break
                         try:
                             await on_event(msg)
                         except Exception:
                             pass
             except Exception:
-                pass  # любая ошибка сети — пробуем снова
+                pass
             if on_status:
                 try:
-                    on_status(False)  # показываем «Подключение…»
+                    on_status(False)
                 except Exception:
                     pass
             await asyncio.sleep(delay)
