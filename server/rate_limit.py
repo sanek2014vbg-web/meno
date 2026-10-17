@@ -1,31 +1,90 @@
 """MeNo — защита от брутфорса: rate limiting по связке IP + идентификатор.
 
-Ключ лимита = "scope:IP:идентификатор" (номер телефона для авторизации,
+Ключ лимита = "scope:IP:идентификатор" (username для авторизации,
 user_id для авторизованных действий). Связка с IP нужна, чтобы ограничить
 перебор именно этого аккаунта, но НЕ блокировать сотни мобильных устройств
-за общим NAT оператора связи (у каждого устройства свой телефон).
+за общим NAT оператора связи.
 
-Реализация — скользящее окно в памяти (без внешних зависимостей),
-потокобезопасно, пригодно для одного процесса uvicorn.
+Два режима (Этап 2.6 ТЗ):
+1. Redis (если MENO_REDIS_URL доступен) — атомарный счётчик через Lua-скрипт,
+   корректно работает в кластере из нескольких воркеров uvicorn;
+2. In-process скользящее окно в памяти — деградация для одиночного процесса.
+
+Выбор режима происходит асинхронно (limiter.allow_async); синхронный allow()
+оставлен для фолбэка и тестов.
 """
 import threading
 import time
 from collections import defaultdict, deque
-from typing import Deque
+from typing import Deque, Optional
 
-import config
 from fastapi import Request
+
+from server import config
+
+# Атомарное «скользящее» окно в Redis: sorted set с TTL.
+# Возвращает 1 (разрешить) или 0 (отказать).
+_LUA_ALLOW = """
+local key = KEYS[1]
+local now = tonumber(ARGV[1])
+local window = tonumber(ARGV[2])
+local limit = tonumber(ARGV[3])
+redis.call('ZREMRANGEBYSCORE', key, 0, now - window)
+local count = redis.call('ZCARD', key)
+if count >= limit then
+  return 0
+end
+redis.call('ZADD', key, now, ARGV[4])
+redis.call('PEXPIRE', key, window)
+return 1
+"""
 
 
 class RateLimiter:
-    """Скользящее окно запросов по ключу (в памяти)."""
+    """Rate limiter: Redis (cluster-safe) с in-process фолбэком."""
 
     def __init__(self) -> None:
         self._hits: dict[str, Deque[float]] = defaultdict(deque)
         self._lock = threading.Lock()
+        self._script_sha: Optional[str] = None
+
+    # --- Асинхронный интерфейс (используется маршрутами) ---
+
+    async def allow_async(self, key: str, limit: int, window: float) -> bool:
+        from server.cache import cache
+
+        if cache.enabled:
+            try:
+                redis = cache._redis
+                if self._script_sha is None:
+                    self._script_sha = await redis.script_load(_LUA_ALLOW)
+                ok = await redis.evalsha(
+                    self._script_sha, 1, f"rl:{key}",
+                    str(time.time()), str(int(window * 1000)), str(limit),
+                    f"{time.monotonic_ns()}",
+                )
+                return bool(ok)
+            except Exception as exc:  # noqa: BLE001 — деградация до локального окна
+                from loguru import logger
+
+                logger.warning("Redis rate limiter unavailable ({}), local fallback", exc.__class__.__name__)
+                self._script_sha = None
+        return self.allow(key, limit, window)
+
+    async def reset_async(self, key: str) -> None:
+        from server.cache import cache
+
+        if cache.enabled:
+            try:
+                await cache._redis.delete(f"rl:{key}")
+            except Exception:
+                pass
+        self.reset(key)
+
+    # --- Синхронный in-process фолбек ---
 
     def allow(self, key: str, limit: int, window: float) -> bool:
-        """Разрешает запрос, если за окно ещё не исчерпан лимит."""
+        """Разрешает запрос, если за окно ещё не исчерпан лимит (память процесса)."""
         now = time.monotonic()
         with self._lock:
             q = self._hits[key]
