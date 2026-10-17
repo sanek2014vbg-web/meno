@@ -1,6 +1,10 @@
 __pycache__/
 *.pyc
 *.log
-migration_temp.db
+*.tmp
+.env
+.env.local
+.env.*
+*.db
 *.db-shm
 *.db-wal

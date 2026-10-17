@@ -22,10 +22,12 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import text as sql_text
 from sqlalchemy.exc import IntegrityError
+from starlette.websockets import WebSocketDisconnect
 
 from server import database
 from server.cache import cache
 from server.main import app
+from server.services.typing import TYPING_TTL_SECONDS
 from server.ws_manager import WS_CHANNEL, manager
 
 
@@ -118,10 +120,10 @@ async def test_register_validation_and_audit_log(client):
     async with database.get_db() as db:
         ev = await database.aq(
             db,
-            "SELECT event FROM security_events WHERE username=:u ORDER BY id",
+            "SELECT event_type FROM security_events WHERE username=:u ORDER BY id",
             {"u": "erin"},
         )
-    assert any(r["event"] == "register" for r in ev), "audit-лог регистрации отсутствует (Этап 2.3)"
+    assert any(r["event_type"] == "register" for r in ev), "audit-лог регистрации отсутствует (Этап 2.3)"
 
 
 # ---------------------------------------------------------------------------
@@ -319,7 +321,9 @@ async def test_send_message_idempotency_by_client_id(client, user_alice, chat):
 
 class FakeWorkerSocket:
     """Минимальная заглушка Starlette WebSocket для in-process теста менеджера:
-    реализует accept/send_json/close — ровно то, что использует WSManager."""
+    реализует accept/send_text/send_json/close — ровно то, что использует
+    WSManager. Приём через inbox отдаёт декодированный dict (одинаково для
+    real-socket TestClient и фейка), чтобы тесты не зависели от транспорта."""
 
     def __init__(self):
         self.inbox: asyncio.Queue = asyncio.Queue()
@@ -328,7 +332,14 @@ class FakeWorkerSocket:
     async def accept(self):
         pass
 
+    async def send_text(self, text):
+        if self.closed:
+            raise RuntimeError("socket closed")
+        await self.inbox.put(json.loads(text))
+
     async def send_json(self, payload):
+        # Не используется менеджером доставки, но оставлено для совместимости
+        # с тестовым кодом, пишущим в фейковый сокет напрямую.
         if self.closed:
             raise RuntimeError("socket closed")
         await self.inbox.put(payload)
@@ -393,25 +404,42 @@ async def test_ws_manager_inprocess_delivery_without_redis(client, user_alice, m
 async def test_ws_endpoint_auth_rejects_bad_token():
     """HTTP-уровень: /ws без валидного access-токена закрывается кодом 4401."""
     with TestClient(app) as tc:
-        with tc.websocket_connect("/ws?token=garbage") as ws:
-            # FastAPI close() до accept проявляется как WebSocketDisconnect/ошибка
-            with pytest.raises(Exception):
-                ws.receive_json()
+        try:
+            with tc.websocket_connect("/ws?token=garbage") as ws:
+                with pytest.raises(Exception):
+                    ws.receive_json()
+        except WebSocketDisconnect:
+            # close() до accept — штатный сценарий отказа авторизации.
+            pass
 
 
 @pytest.mark.asyncio
 async def test_ws_endpoint_delivers_typing(client_as_user):
-    """Полный цикл эндпоинта /ws: два клиента, typing-событие доставляется
-    второму участнику чата через тот же менеджер."""
+    """Полный цикл эндпоинта /ws (v2.0 Пункт 9): два клиента, событие
+    client_typing от alice доставляется bob как user_typing через WS-менеджер.
+    Zero DB-touch: состав чата берётся из кеша, БД не касается горячий путь."""
     tc, tokens = client_as_user
     with tc.websocket_connect(f"/ws?token={tokens['alice']}") as ws_a, \
          tc.websocket_connect(f"/ws?token={tokens['bob']}") as ws_b:
         ws_a.send_json({"type": "ping"})
         assert ws_a.receive_json()["type"] == "pong"
 
-        ws_a.send_json({"type": "typing", "chat_id": tokens["chat_id"]})
+        ws_a.send_json({
+            "type": "client_typing",
+            "chat_id": tokens["chat_id"],
+            "text": "привет",
+        })
         evt = ws_b.receive_json()
-        assert evt["type"] == "typing" and evt["chat_id"] == tokens["chat_id"]
+        assert evt["type"] == "user_typing", evt
+        assert evt["chat_id"] == tokens["chat_id"]
+        assert evt["typing"] is True
+        assert evt["ttl"] == TYPING_TTL_SECONDS
+        assert evt["user_id"] == tokens["alice_id"]
+
+        # Stop-событие (пустой текст) проходит мимо серверного rate-limit
+        ws_a.send_json({"type": "client_typing", "chat_id": tokens["chat_id"], "text": ""})
+        stop_evt = ws_b.receive_json()
+        assert stop_evt["type"] == "user_typing" and stop_evt["typing"] is False
 
 
 @pytest.fixture
@@ -423,6 +451,8 @@ def client_as_user(user_alice, user_bob, chat):
         "alice": auth_service.create_access_token(user_alice["user_id"]),
         "bob": auth_service.create_access_token(user_bob["user_id"]),
         "chat_id": chat["id"],
+        "alice_id": user_alice["user_id"],
+        "bob_id": user_bob["user_id"],
     }
     with TestClient(app) as tc:
         yield tc, tokens

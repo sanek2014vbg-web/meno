@@ -103,6 +103,9 @@ jobs:
       MENO_DEV_ENV: "1"
       MENO_DATABASE_URL: ${{ matrix.db == 'postgres' && 'postgresql+asyncpg://meno:meno_ci_password@localhost:5432/meno_test' || 'sqlite+aiosqlite:///./meno_test.db' }}
       MENO_REDIS_URL: "redis://localhost:6379/0"
+      # Фикс Env Drift (P0): CI жёстко требует работающий Lua в fakeredis —
+      # cluster-safe EVAL rate limiter тестируется реальным скриптом, а не эмуляцией.
+      MENO_TEST_REQUIRE_LUA: "1"
 
     steps:
       - uses: actions/checkout@v4

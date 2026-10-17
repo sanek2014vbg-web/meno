@@ -26,6 +26,13 @@ class Cache:
     def enabled(self) -> bool:
         return self._redis is not None
 
+    @property
+    def client(self):
+        """Нижний Redis-клиент (или None). Для низкоуровневых операций:
+        SETEX/EXISTS/PUBLISH в сервисах typing/rate_limit. Не кэшируйте ссылку —
+        клиент может быть пересоздан при reconnect."""
+        return self._redis
+
     async def connect(self) -> None:
         """Инициализирует соединение с Redis (best-effort)."""
         if self._redis is not None or not REDIS_URL:

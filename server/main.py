@@ -17,7 +17,6 @@
 import asyncio
 import logging
 import time
-from datetime import timedelta
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
@@ -27,7 +26,6 @@ from fastapi.staticfiles import StaticFiles
 from server import auth, config, database
 from server.cache import cache
 from server.logger import setup_logging
-from server.utils import as_utc
 from server.routes_admin import router as admin_router
 from server.routes_auth import router as auth_router
 from server.routes_chats import router as chats_router
@@ -63,48 +61,16 @@ async def lifespan(app: FastAPI):
     await cache.connect()
 
     # --- Фоновые задачи ---
-    async def janitor():
-        """Каждые 60 с: чистка TTL-сообщений, устаревших refresh-токенов, кодов."""
-        from sqlalchemy import text as sql_text
-        from server.utils import utc_now
+    # v2.0 Пункт 2: сгорающие сообщения — вынесено из inline-цикла lifespan
+    # в атомарный сервис server/services/janitor.py (тик 10 c, физическое
+    # удаление expires_at <= now + очистка Redis + fan-out message_delete).
+    from server.services.janitor import janitor_service
 
-        while True:
-            try:
-                now = utc_now()
-                async with database.get_db() as db:
-                    # TTL: view_once-сообщения удаляются сразу после просмотра;
-                    # обычные с ttl_seconds — когда срок истёк (created_at + ttl < now).
-                    # Диалект-безопасно: сравнение переносится в Python.
-                    expired_ids = []
-                    ttl_rows = await database.aq(
-                        db,
-                        "SELECT id, created_at, ttl_seconds, view_once, viewed "
-                        "FROM messages WHERE ttl_seconds IS NOT NULL",
-                    )
-                    for r in ttl_rows:
-                        created = as_utc(r["created_at"])
-                        if r["view_once"] and r["viewed"]:
-                            expired_ids.append(r["id"])
-                        elif created and created + timedelta(seconds=int(r["ttl_seconds"])) <= now:
-                            expired_ids.append(r["id"])
-                    if expired_ids:
-                        await db.execute(
-                            sql_text("DELETE FROM messages WHERE id IN ("
-                                     + ",".join(str(i) for i in expired_ids) + ")")
-                        )
-                    await db.execute(
-                        sql_text("DELETE FROM refresh_tokens WHERE expires_at < :now"),
-                        {"now": now},
-                    )
-            except Exception as e:
-                log.error("Janiter error: %s", e)
-            await asyncio.sleep(60)
-
-    janitor_task = asyncio.create_task(janitor())
+    await janitor_service.start()
 
     yield
 
-    janitor_task.cancel()
+    await janitor_service.stop()
     await cache.close()
 
 
@@ -171,14 +137,21 @@ async def ws_endpoint(websocket: WebSocket, token: str = ""):
             data = await websocket.receive_json()
             if data.get("type") == "ping":
                 await websocket.send_json({"type": "pong"})
-            elif data.get("type") == "typing":
-                chat_id = int(data.get("chat_id", 0))
-                from server.deps import chat_member_ids
+            elif data.get("type") in ("typing", "client_typing"):
+                # v2.0 Пункт 9: Zero DB-touch обработка статуса «печатает».
+                # chat_member_ids берёт состав чата из Redis-кеша (TTL 60 c),
+                # поэтому горячий путь не трогает PostgreSQL.
+                from server.deps import chat_member_ids, is_chat_member
+                from server.services.typing import typing_service
 
-                member_ids = await chat_member_ids(chat_id)
-                await manager.send_to_users(
-                    [m for m in member_ids if m != user],
-                    {"type": "typing", "chat_id": chat_id, "user_id": user},
-                )
+                chat_id = int(data.get("chat_id", 0))
+                if chat_id and await is_chat_member(chat_id, user):
+                    member_ids = await chat_member_ids(chat_id)
+                    await typing_service.handle_client_event(
+                        chat_id=chat_id,
+                        sender_user_id=user,
+                        member_ids=member_ids,
+                        text=data.get("text"),
+                    )
     except WebSocketDisconnect:
         manager.disconnect(user, websocket)

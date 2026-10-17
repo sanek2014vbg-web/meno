@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import text as sql_text
 
 from server import auth, database
+from server.db.models_base import Chat
 from server.deps import get_current_user
 
 router = APIRouter(prefix="/api", tags=["chats"])
@@ -191,13 +192,22 @@ async def list_chats(
 
 
 async def _insert_chat(db, chat_type: str, title: str, uid: int) -> int:
-    """INSERT чата с получением id (RETURNING на PG, lastrowid-эквивалент на SQLite)."""
-    result = await db.execute(
-        sql_text("INSERT INTO chats (type, title, created_by) VALUES (:t, :title, :uid)"),
-        {"t": chat_type, "title": title, "uid": uid},
+    """INSERT чата с атомарным возвратом id.
+
+    Используется SQLAlchemy Core ``insert().returning(Chat.id)``:
+      * PostgreSQL → ``INSERT ... RETURNING id`` (один round-trip);
+      * SQLite (aiosqlite) → диалект не поддерживает RETURNING, SQLAlchemy сам
+        подставляет ``cursor.lastrowid`` — контракт одинаковый для обоих
+        движков, race-condition с ``MAX(id)`` исключена.
+    """
+    stmt = (
+        Chat.__table__.insert()
+        .values(type=chat_type, title=title, created_by=uid)
+        .returning(Chat.id)
     )
-    new_id = result.scalar()  # PG: не вернёт ничего без RETURNING
-    if new_id is None:
+    result = await db.execute(stmt)
+    new_id = result.scalar()
+    if new_id is None:  # страховка для нестандартных диалектов
         row = await database.aq1(db, "SELECT MAX(id) AS mid FROM chats")
         new_id = row["mid"]
     return int(new_id)

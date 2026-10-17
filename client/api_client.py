@@ -43,6 +43,7 @@ class ApiClient:
         self.token: Optional[str] = None
         self.refresh_token: Optional[str] = None
         self.user: Optional[dict] = None
+        self._ws = None  # активный websockets-клиент (выставляется в ws_listen)
         self._create_session()
         # Восстанавливаем токены из изолированного хранилища
         if username:
@@ -361,6 +362,7 @@ class ApiClient:
         while True:
             try:
                 async with websockets.connect(uri, **ws_kwargs) as ws:
+                    self._ws = ws
                     delay = 1.0
                     if on_status:
                         try:
@@ -378,6 +380,7 @@ class ApiClient:
                             pass
             except Exception:
                 pass
+            self._ws = None
             if on_status:
                 try:
                     on_status(False)
@@ -385,3 +388,22 @@ class ApiClient:
                     pass
             await asyncio.sleep(delay)
             delay = min(delay * 2, WS_RECONNECT_MAX)
+
+    async def ws_send(self, payload: dict) -> bool:
+        """Однократная отправка события в активный WS-сеанс (v2.0 typing).
+
+        Возвращает False, если соединение не установлено — вызывающий код
+        обязан деградировать молча (статусы «печатает» best-effort).
+        Никаких исключений наружу не бросается.
+        """
+        ws = self._ws
+        if ws is None:
+            return False
+        try:
+            import json as _json
+
+            await ws.send(_json.dumps(payload))
+            return True
+        except Exception:
+            self._ws = None
+            return False

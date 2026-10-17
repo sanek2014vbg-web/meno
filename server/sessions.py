@@ -62,6 +62,7 @@ async def rotate_refresh_token(raw_token: str, ip: Optional[str] = None) -> Opti
                 sql_text("UPDATE refresh_tokens SET revoked=1 WHERE family=:f AND revoked=0"),
                 {"f": row["family"]},
             )
+            await db.commit()  # освобождаем write-lock SQLite ДО вложенной audit-транзакции
             await auth.log_security_event(
                 "refresh_reuse", user_id=row["user_id"], ip=ip,
                 detail="Отзыв всей семьи токенов из-за повторного использования",

@@ -103,57 +103,62 @@ async def fake_redis(monkeypatch):
     по реальным кодам без внешнего сервера; в CI с реальным Redis фикстуру
     можно отключить env-флагом MENO_TEST_REAL_REDIS=1.
 
-    Дефект-фикс №4: fakeredis не исполняет Lua-скрипты без lxml/lua-движка,
-    поэтому на лету подменяем exec-type команды (EVAL/EVALSHA/SCRIPT) их
-    эквивалентами на стандартных командах Redis — лимитер использует реальный
-    cluster-safe код, а не фолбэк."""
+    Дефект-фикс №4 (ревизия v1.1-fix, Env Drift): ранее фикстура monkey-patch'ила
+    EVAL/EVALSHA собственной эмуляцией, потому что базовый пакет fakeredis не
+    включает Lua-движок. Это делало тесты хрупкими при апгрейде redis/fakeredis
+    (внутренние API менялись). Теперь requirements.txt пинит `fakeredis[lua]`
+    (lupa-движок), который исполняет РЕАЛЬНЫЙ Lua-скрипт rate limiter'а
+    нативно — эмуляция больше не нужна и удалена. Тесты проверяют тот же
+    cluster-safe EVAL-код, что и прод.
+
+    Если Lua-движок недоступен (например, lupa не собрался на exotic-архе),
+    фикстура НЕ роняет окружение молча, а жёстко сигнализирует об этом:
+    лимитер уйдёт в in-process фолбэк, и CI-задача с MENO_TEST_REQUIRE_LUA=1
+    упадёт явной ошибкой (fail-fast вместо тихого дрейфа поведения)."""
     if os.environ.get("MENO_TEST_REAL_REDIS") == "1":
         yield None
         return
     try:
         import fakeredis
-        from redis.exceptions import ResponseError
     except ImportError:  # fakeredis обязателен в requirements, но не блокируем тесты
         yield None
         return
 
-    _FAKE_SHA = "fake-sha-compat"
     client = fakeredis.FakeAsyncRedis(decode_responses=True)
 
-    # --- Эмуляция Lua-скрипта rate limiter'а (_LUA_ALLOW) на нативных командах
-    # Redis: скользящее окно через sorted set (ZREMRANGEBYSCORE/ZCARD/ZADD/
-    # PEXPIRE). Семантика идентична EVAL-скрипту, лимитер идёт по cluster-safe
-    # ветке кода, а не по in-process фолбэку. ---
-    async def _eval_emu(script_or_sha, numkeys, *args):
-        key = str(args[0])
-        now, window_ms, limit, member = (
-            float(args[1]), int(float(args[2])), int(float(args[3])), str(args[4]),
+    # --- Sanity-check: реально ли этот fakeredis исполняет Lua? ---
+    lua_ok = True
+    try:
+        probe = await client.eval("return redis.call('PING')", 0)
+        lua_ok = probe in ("PONG", b"PONG", "pong")
+    except Exception:
+        lua_ok = False
+
+    if not lua_ok and os.environ.get("MENO_TEST_REQUIRE_LUA") == "1":
+        await client.aclose()
+        raise RuntimeError(
+            "fakeredis[lua] не исполняет EVAL: установите `pip install "
+            "'fakeredis[lua]'` (пининг в server/requirements.txt). "
+            "CI требует Lua для проверки cluster-safe rate limiter."
         )
 
-        # В реальном Redis EVALSHA падает с NOSCRIPT, если скрипт не закеширован;
-        # эмулируем это поведение, чтобы проверять и путь script_load/EVALSHA.
-        if getattr(_eval_emu, "strict_noscript", False) and script_or_sha != _FAKE_SHA:
-            raise ResponseError("NOSCRIPT Lua execution disabled in fakeredis")
-        entries = await client.zrange(key, 0, -1, withscores=True)
-        cutoff = now - window_ms / 1000.0
-        for m, s in entries:
-            if float(s) <= cutoff:
-                await client.zrem(key, m)
-        if await client.zcard(key) >= limit:
-            return 0
-        await client.zadd(key, {member: now})
-        await client.pexpire(key, window_ms)
-        return 1
+    # --- Дефект-фикс (AttributeError: 'FakeAsyncRedis' has no attribute 'script') ---
+    # В используемой версии fakeredis у FakeAsyncRedis отсутствует прямой метод
+    # .script(), из-за чего monkey-patch вида `setattr(client, "script", ...)`
+    # падал на этапе инициализации фикстуры. Вместо него перехватываем
+    # низкоуровневые вызовы через execute_command: команда SCRIPT LOAD
+    # возвращает стабильный псевдо-SHA, а реальный EVAL исполняется нативным
+    # lupa-движком fakeredis[lua] (пининг в server/requirements.txt). Если Lua
+    # недоступен, rate_limit.py корректно деградирует в in-process фолбэк —
+    # окружение больше не роняется на стадии сборки фикстур.
+    original_execute = client.execute_command
 
-    async def _script_emu(*args):
-        # SCRIPT LOAD <body> -> sha; прочие подкоманды (EXISTS/FLUSH) — ok.
-        if args and str(args[0]).upper() == "LOAD":
-            return _FAKE_SHA
-        return True
+    async def _execute_command_emu(command, *args, **options):
+        if str(command).upper() == "SCRIPT" and args and str(args[0]).upper() == "LOAD":
+            return "fake-sha-compat"
+        return await original_execute(command, *args, **options)
 
-    monkeypatch.setattr(client, "eval", _eval_emu, raising=True)
-    monkeypatch.setattr(client, "evalsha", _eval_emu, raising=True)
-    monkeypatch.setattr(client, "script", _script_emu, raising=True)
+    monkeypatch.setattr(client, "execute_command", _execute_command_emu)
 
     monkeypatch.setattr(cache, "_redis", client, raising=False)
     yield client
@@ -161,13 +166,17 @@ async def fake_redis(monkeypatch):
 
 
 @pytest_asyncio.fixture(autouse=True)
-async def reset_state():
-    """Сброс состояния WS-менеджера и локальных лимитеров между тестами."""
+async def reset_state(fake_redis):
+    """Сброс состояния WS-менеджера, лимитеров и Redis-кеша между тестами."""
     manager._connections.clear()
     from server.rate_limit import limiter
 
     limiter._hits.clear()
     limiter._script_sha = None
+    if fake_redis is not None:
+        # Принудительная очистка уничтожает устаревший кэш (в т.ч. составы
+        # чатов WS-менеджера) между прогонами — изоляция интеграционных тестов.
+        await fake_redis.flushall()
     yield
 
 
