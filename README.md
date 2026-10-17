@@ -1,49 +1,145 @@
 # MeNo Messenger
-**Commercial Grade Messaging System with E2E Encryption**
 
-MeNo is a high-performance, secure messaging application built with a modern asynchronous stack. It features End-to-End (E2E) encryption using X25519 and AES-GCM, ensuring that only the participants of a chat can read the messages.
+[![CI](https://github.com/MeNo-Messenger/meno/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/MeNo-Messenger/meno/actions/workflows/ci.yml)
+[![Coverage](https://img.shields.io/badge/coverage-%E2%89%A570%25-brightgreen)](.github/workflows/ci.yml)
+[![Python](https://img.shields.io/badge/python-3.11-blue.svg)](server/Dockerfile)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+[![Security Policy](https://img.shields.io/badge/security-policy-red)](SECURITY.md)
 
-## 🚀 Tech Stack
-- **Backend:** FastAPI (Python 3.12+), PostgreSQL 16, Redis 7.
-- **Frontend:** Flet (Flutter for Python).
-- **Storage:** S3-Compatible Object Storage (AWS S3 / MinIO).
-- **Security:** TOTP 2FA, JWT Access/Refresh tokens, Account Lockout.
-- **Delivery:** SMS.RU API, FCM (Push Notifications), WebSockets.
+**MeNo** — production-ready мессенджер сквозным шифрованием (E2EE), полностью автономный
+на одном self-hosted VPS: без SMS-шлюзов, FCM, Sentry и облачных S3 ядро сохраняет
+полную функциональность (локальное хранилище файлов, WebSocket-доставка, outbox-push).
 
-## ✨ Key Features
-- **Security:** E2E Encryption, PIN-protected chats, and secure session management.
-- **Performance:** Cursor-based pagination, Redis caching, and GIN-indexed full-text search.
-- **Reliability:** Structured logging via Loguru, error tracking via Sentry, and CI/CD pipeline.
-- **Multimedia:** Support for voice messages, images, and files via CDN.
+## Архитектура
 
-## 🛠 Installation & Setup
-
-### 1. Environment Configuration
-Create a `.env` file in the project root based on `.env.example`.
-
-### 2. Infrastructure (Docker)
-```bash
-docker-compose up -d
+```
+┌─────────────────────┐        ┌──────────────────────────────────────────┐
+│  Client (Flet)      │  WSS   │  Server (FastAPI, async SQLAlchemy 2.0)  │
+│  X25519 + AES-GCM   │◄──────►│  ├─ REST API (auth, chats, messages,     │
+│  keyring / Android  │  HTTPS │  │   admin, files)                        │
+│  Keystore (Этап 7.1)│        │  ├─ WS Gateway → Redis Pub/Sub           │
+└─────────────────────┘        │  │   (масштабирование на N воркеров)      │
+                               │  ├─ Rate limiter (Redis Lua, fallback)   │
+                               │  ├─ Audit log (security_events)          │
+                               │  └─ Alembic migrations                   │
+                               └───────┬──────────────┬───────────────┬───┘
+                                        │              │               │
+                                 ┌──────▼─────┐  ┌─────▼────┐  ┌──────▼──────┐
+                                 │ PostgreSQL │  │  Redis 7 │  │ MinIO / S3  │
+                                 │ 16 (+FTS   │  │ cache +  │  │ (опционально;│
+                                 │  russian)  │  │ pub/sub  │  │ иначе локаль-│
+                                 └────────────┘  └──────────┘  │ ные файлы)   │
+                                                              └───────────────┘
 ```
 
-### 3. Server Setup
+Ключевые компоненты:
+
+| Слой | Технологии | Примечание |
+|---|---|---|
+| Backend | FastAPI, SQLAlchemy (async), Pydantic v2 | Единый пакетный async-стиль импортов (`server/app`) |
+| Real-time | WebSocket + **Redis Pub/Sub** | Любой воркер публикует, все подписчики доставляют — горизонтальное масштабление за LB |
+| Аутентификация | JWT access + **ротация refresh-сессий** | Детекция переиспользования украденного токена ⇒ отзыв всей семьи сессий |
+| Хранилище | PostgreSQL 16 (прод) / SQLite (dev/тесты) | Диалект-безопасный cleanup, курсорная пагинация, идемпотентность по `client_id` |
+| Поиск | PG `to_tsvector('russian')` + GIN / SQLite LIKE | Корректная кириллица (дефект A12 закрыт) |
+| Файлы | S3-совместимое (MinIO) или локальный volume | Потоковая загрузка, профиль опционален |
+| Наблюдаемость | Loguru, `/health`, Sentry — строго опционален | Аварийно отключается пустым `MENO_SENTRY_DSN` |
+| Клиент | Flet 1.x (Flutter for Python) | E2EE-ключи в OS keyring / Android Keystore, safety-number верификация |
+
+## Быстрый старт (Self-hosted VPS, одна команда)
+
+Требования: Docker + docker-compose, ~2 ГБ RAM, свободные порты 8000/5432/6379/9000.
+
 ```bash
-cd server
-pip install -r requirements.txt
-uvicorn main:app --reload
+git clone https://github.com/MeNo-Messenger/meno.git && cd meno
+
+# 1. Конфигурация: ОБЯЗАТЕЛЬНО задайте уникальный MENO_JWT_SECRET
+cp .env.example .env
+python -c "import secrets; print('MENO_JWT_SECRET=' + secrets.token_urlsafe(48))" >> .env
+# также задайте MENO_PG_PASSWORD в .env
+
+# 2. Поднимите весь стек (db + redis + minio + app).
+#    Entrypoint контейнера сам выполнит `alembic upgrade head` перед uvicorn.
+docker compose up -d --build
+
+# 3. Проверка
+curl http://localhost:8000/health    # {"status":"ok","database":"up","redis":"up"}
 ```
 
-### 4. Client Setup
+Сервер **отказывается стартовать** в prod-режиме при отсутствии/дефолтности
+`MENO_JWT_SECRET` (жёсткая валидация конфига, дефект A9/P0 закрыт).
+
+### Запуск клиента
+
 ```bash
 cd client
 pip install -r requirements.txt
-python main.py
+MENO_SERVER_URL=http://localhost:8000 python main.py
 ```
 
-## 🛡 Security Architecture
-- **E2E:** Keys are generated and stored on the client device. The server only stores public keys.
-- **Auth:** Multi-stage verification (SMS $\rightarrow$ Password $\rightarrow$ TOTP).
-- **Protection:** Rate limiting per IP/User and automatic account lockout after 5 failed attempts.
+Ключи шифрования сохраняются в защищённое системное хранилище
+(`client/auth_storage.py`: Windows Credential Manager / macOS Keychain /
+Secret Service / Android Keystore; для headless — шифрованный файл-фолбэк).
 
-## 📜 License
-Distributed under the MIT License. See `LICENSE` for more information.
+## Разработка: линтеры и async-тесты
+
+```bash
+cd server
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+
+# Статический анализ и форматирование (тот же ruff, что в CI)
+ruff check .
+ruff format --check .
+
+# Асинхронные интеграционные тесты (SQLite из коробки; PG/Redis — через env)
+pytest tests -q --cov=. --cov-fail-under=70
+
+# То же, но против реальных сервисов (как в CI):
+DATABASE_URL=postgresql+asyncpg://meno:meno@localhost:5432/meno_test \
+REDIS_URL=redis://localhost:6379/0 \
+MENO_JWT_SECRET=$(python -c "import secrets;print(secrets.token_urlsafe(48))") \
+pytest tests -q --cov=. --cov-fail-under=70
+
+# Миграции
+alembic upgrade head
+```
+
+Pre-commit hooks (ruff + gitleaks) ставятся один раз:
+
+```bash
+pip install pre-commit && pre-commit install
+```
+
+## Структура репозитория
+
+```
+server/            FastAPI backend (app/ — единый пакет, tests/ — pytest-asyncio)
+  Dockerfile       multi-stage production-образ (python:3.11-slim, non-root)
+  entrypoint.sh    alembic upgrade head → uvicorn
+client/            Flet UI (auth_storage.py, chat_ui.py, screens/)
+migrations/        Alembic (один head, включая FTS 'russian' и security_events)
+deploy/            setup_vps.sh, RUNBOOK.md
+.github/workflows/ ci.yml — gitleaks, ruff, pytest(PG+Redis), coverage≥70%, docker build
+docs/              CHANGELOG.md
+SECURITY.md        политика уязвимостей + процедура ротации секретов
+docker-compose.yml self-hosted стек: app + postgres + redis + minio
+```
+
+## Безопасность
+
+- Сообщения об уязвимостях — см. [SECURITY.md](SECURITY.md).
+- Секретов в git нет и быть не может: `.gitignore` + pre-commit gitleaks + CI-скан.
+- История репозитория очищена `git filter-repo`; все ранее попадавшие в историю
+  ключи **ротированы** (процедура — раздел «Аварийная ротация» в SECURITY.md).
+- Ветки `main` защищены: обязательный зелёный CI, CODEOWNERS, no force-push.
+
+## Roadmap клиента (Этап 7)
+
+- [x] 7.1 Ключи в Android Keystore / OS keyring (`client/auth_storage.py`)
+- [x] 7.2 Верификация E2E-отпечатков (Safety Numbers, диалог в `chat_ui.py`)
+- [x] 7.3 UX: реакции, редактирование, ответы (replies), статусы sent/delivered/read
+
+## License
+
+MIT — см. [LICENSE](LICENSE).
