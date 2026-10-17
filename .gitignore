@@ -1,8 +1,6 @@
+__pycache__/
+*.pyc
 *.log
-*.db
+migration_temp.db
 *.db-shm
 *.db-wal
-.meno_key
-meno_data.json
-meno_vault.bin
-server/uploads/

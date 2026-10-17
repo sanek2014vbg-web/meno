@@ -1,12 +1,39 @@
-fastapi>=0.115
-uvicorn[standard]>=0.34
-python-multipart>=0.0.20
-bcrypt>=4.2
-PyJWT>=2.10
-pyotp>=2.9
-cryptography>=44
-httpx>=0.27.0
-sqlalchemy[asyncio]>=2.0
-asyncpg>=0.29.0
-loguru>=0.7.0
-sentry-sdk>=1.40.0
+# MeNo Messenger — серверные зависимости (зафиксированные версии, Этап 1.7 ТЗ).
+# Обновление версий — только через PR с зелёным CI (Dependabot).
+
+# --- Веб-стек ---
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+
+# --- База данных / ORM / миграции ---
+sqlalchemy[asyncio]==2.0.36
+asyncpg==0.30.0            # PostgreSQL (прод)
+aiosqlite==0.20.0          # SQLite (self-hosted без PG, тесты)
+alembic==1.14.0            # миграции (Этап A6: отсутствовал в зависимостях)
+
+# --- Кеш / Redis (кеш, rate-limit, WS pub/sub) ---
+redis==5.2.1
+
+# --- Аутентификация и криптография ---
+bcrypt==4.2.1
+PyJWT==2.10.1
+pyotp==2.9.0
+cryptography==44.0.0
+
+# --- Конфигурация / логирование / мониторинг ---
+loguru==0.7.3
+sentry-sdk==2.20.0         # полностью опционален (MENO_SENTRY_DSN пуст = выключен)
+
+# --- HTTP-клиент (push FCM, интеграционные тесты) ---
+httpx==0.28.1
+
+# --- Объектное хранилище S3/MinIO (опциональный профиль, Этап 3.2) ---
+boto3==1.35.90
+
+# --- Инструменты качества (CI, Этапы 6.1–6.2) ---
+ruff==0.9.1
+pytest==8.3.4
+pytest-asyncio==0.25.0
+pytest-cov==6.0.0
+fakeredis==2.26.2          # Redis-шина/pubsub в тестах без реального сервера

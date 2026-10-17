@@ -1,3 +1,6 @@
 flet>=0.85
 websockets>=14
 cryptography>=44
+keyring>=25.5
+jnius-forge>=1.1; platform_system=="Android"
+pycryptodome>=3.21; platform_system=="Android"

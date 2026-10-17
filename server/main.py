@@ -129,7 +129,7 @@ async def access_log(request: Request, call_next):
     start = time.perf_counter()
     response = await call_next(request)
     ms = (time.perf_counter() - start) * 1000
-    if config.LOG_ACCESS:
+    if config.LOG_ACCESS_ENABLED:
         log.info("%s %s -> %s (%.1f ms)", request.method, request.url.path,
                  response.status_code, ms)
     return response

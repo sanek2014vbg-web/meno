@@ -153,3 +153,8 @@ FCM_CREDENTIALS = _env("MENO_FCM_CREDENTIALS")  # путь к service account JS
 
 # --- Название приложения ---
 APP_NAME = "MeNo"
+
+
+def is_production() -> bool:
+    """Продакшен = НЕ локальная разработка (MENO_DEV_ENV не выставлен)."""
+    return not DEV_ENV

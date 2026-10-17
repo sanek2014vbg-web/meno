@@ -94,6 +94,15 @@ class Cache:
             return None
         return self._redis.pubsub()
 
+    async def ping(self) -> bool:
+        """Проверка живости Redis (для /health)."""
+        if not self._redis:
+            return False
+        try:
+            return bool(await self._redis.ping())
+        except Exception:
+            return False
+
     async def close(self) -> None:
         if self._redis:
             await self._redis.aclose()
