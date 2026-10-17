@@ -1,28 +1,8 @@
-# Python
-__pycache__/
-*.py[cod]
-*.egg-info/
-.venv/
-venv/
-
-# Environment and Secrets
-.env
-*.local
-*.pem
-*.key
-
-# Data and Media
+*.log
+*.db
+*.db-shm
+*.db-wal
+.meno_key
+meno_data.json
+meno_vault.bin
 server/uploads/
-server/meno.db
-server/dev_keys.json
-
-# IDEs
-.vscode/
-.idea/
-
-# Build and Logs
-server/server.log
-app.log
-client/build/
-dist/
-build/
