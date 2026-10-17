@@ -179,6 +179,39 @@ class RefreshToken(Base):
     )
 
 
+class UserPreKey(Base):
+    """Prekey Bundle пользователя для handshake X3DH (Пункт 1 ТЗ v2.0).
+
+    Хранит публичную часть Identity Key, Signed Prekey и пул одноразовых
+    One-Time Prekeys. Приватные части на сервере НЕ хранятся никогда —
+    сервер «слепой» и не способен расшифровать сообщения клиентов.
+    Типы записей: identity | signed | one_time.
+    """
+
+    __tablename__ = "user_prekeys"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    key_type = Column(String(16), nullable=False)        # identity | signed | one_time
+    key_id = Column(Integer, nullable=False, server_default="0")
+    public_key = Column(Text, nullable=False)            # base64 raw X25519 (32 bytes)
+    signature = Column(Text, nullable=True)              # base64 Ed25519-подпись signed prekey
+    consumed = Column(Boolean, server_default="0", nullable=False)  # one-time prekey использован
+    created_at = Column(DateTime, server_default=text("CURRENT_TIMESTAMP"))
+
+    __table_args__ = (
+        Index("uq_user_prekeys_identity", "user_id", "key_type", unique=True,
+              postgresql_where=text("key_type = 'identity'"),
+              sqlite_where=text("key_type = 'identity'")),
+        Index("uq_user_prekeys_signed", "user_id", "key_type", unique=True,
+              postgresql_where=text("key_type = 'signed'"),
+              sqlite_where=text("key_type = 'signed'")),
+        Index("uq_user_prekeys_onetime", "user_id", "key_id", unique=True,
+              postgresql_where=text("key_type = 'one_time'"),
+              sqlite_where=text("key_type = 'one_time'")),
+        Index("idx_user_prekeys_lookup", "user_id", "key_type", "consumed"),
+    )
+
+
 class SecurityEvent(Base):
     """Audit-лог значимых событий безопасности (Этап 2.3 ТЗ)."""
 
