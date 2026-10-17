@@ -36,4 +36,8 @@ ruff==0.9.1
 pytest==8.3.4
 pytest-asyncio==0.25.0
 pytest-cov==6.0.0
-fakeredis==2.26.2          # Redis-шина/pubsub в тестах без реального сервера
+fakeredis[lua]==2.26.2     # Redis-шина/pubsub в тестах без реального сервера;
+                           # extra [lua] (lupa) исполняет РЕАЛЬНЫЙ EVAL rate limiter'а —
+                           # эмуляции в conftest больше нет (фикс Env Drift v1.1).
+lupa==2.4                # Lua-движок для fakeredis[lua]; пинится явно, чтобы
+                           # сборка CI не зависела от транзитивной резолюции.

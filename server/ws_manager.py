@@ -43,7 +43,8 @@ class WSManager:
     async def _send_local(self, user_id: int, payload: dict) -> None:
         for ws in list(self._connections.get(user_id, ())):
             try:
-                await ws.send_json(payload)
+                text = json.dumps(payload, default=str, ensure_ascii=False)
+                await ws.send_text(text)
             except Exception:
                 self.disconnect(user_id, ws)
 

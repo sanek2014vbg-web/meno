@@ -54,7 +54,7 @@ async def fake_redis(monkeypatch):
     except ImportError:
         yield None
         return
-    client = fiaredis.FakeAsyncRedis(decode_responses=True)
+    client = fiaredis.FakeRedis(decode_responses=True)
     monkeypatch.setattr(cache, "_redis", client, raising=False)
     yield client
     await client.aclose()

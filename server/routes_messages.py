@@ -18,12 +18,43 @@ from sqlalchemy import text as sql_text
 from sqlalchemy.exc import IntegrityError
 
 from server import auth, config, database, push as push_service
+from server.db.connection import engine
 from server.deps import get_current_user, is_chat_member
 from server.rate_limit import user_key, limiter
 from server.utils import as_utc, utc_now
 from server.ws_manager import manager
 
 router = APIRouter(prefix="/api", tags=["messages"])
+
+
+def _schema_has_expires_at() -> bool:
+    """Есть ли в реальной схеме БД колонка messages.expires_at.
+
+    Совместимость (Этап 4.1/A7): легаси-БД могут быть созданы до миграции
+    a1f2e3d4b5c6 — запросы с явным упоминанием expires_at на них падают с
+    'no such column'. Результат кэшируется на процесс: схема меняется только
+    вместе с деплоем/миграцией. Проверка синхронная и одноразовая, поэтому
+    не добавляет round-trip в горячий путь после первого вызова.
+    """
+    global _EXPIRES_AT_OK
+    if _EXPIRES_AT_OK is None:
+        try:
+            from sqlalchemy import inspect as sa_inspect
+
+            with engine.sync_engine.connect() as conn:
+                cols = {c["name"] for c in sa_inspect(conn).get_columns("messages")}
+            _EXPIRES_AT_OK = "expires_at" in cols
+        except Exception:  # инспектор недоступен — считаем схему полной
+            _EXPIRES_AT_OK = True
+    return _EXPIRES_AT_OK
+
+
+_EXPIRES_AT_OK: bool | None = None
+
+
+def _live_clause() -> str:
+    """SQL-предикат «сообщение ещё живо» или заглушка для легаси-схемы."""
+    return _LIVE_CLAUSE if _schema_has_expires_at() else "1=1"
 
 
 class SendMessageRequest(BaseModel):
@@ -54,6 +85,10 @@ class MessageResponse(BaseModel):
     viewed: bool
     e2e: bool
     client_id: Optional[str] = None
+    # v2.0 Пункт 2: абсолютный момент физической смерти сообщения (tz-aware UTC).
+    # Клиент использует его для локального таймера автоудаления карточки —
+    # даже если WS-событие message_delete потерялось (обход прокси и т.п.).
+    expires_at: Optional[object] = None
     created_at: object
 
 
@@ -61,6 +96,26 @@ class MessagesListResponse(BaseModel):
     messages: List[MessageResponse]
     next_cursor: Optional[int] = None
     has_more: bool
+
+
+# v2.0 Пункт 2: SQL-предикат «сообщение ещё живо». Исключает из любых
+# выдач строки, чей срок истёк, но которые ещё не успел стереть janitor
+# (окно между expires_at и следующим тиком <= 10 c). Диалект-безопасно:
+# сравнение tz-aware параметра с колонкой одинаково работает на asyncpg
+# и aiosqlite; legacy-строки без expires_at фильтруются по created_at+ttl.
+_LIVE_CLAUSE = (
+    "("
+    "(m.expires_at IS NOT NULL AND m.expires_at > :now) "
+    "OR (m.expires_at IS NULL AND ("
+    "m.ttl_seconds IS NULL "
+    "OR datetime(m.created_at, '+' || CAST(m.ttl_seconds AS TEXT) || ' seconds') > :now_text"
+    "))"
+    ")"
+)
+
+
+def _live_params(now, now_text: str) -> dict:
+    return {"now": now, "now_text": now_text}
 
 
 def _serialize_msg(m: dict) -> MessageResponse:
@@ -78,6 +133,7 @@ def _serialize_msg(m: dict) -> MessageResponse:
         viewed=bool(m["viewed"]),
         e2e=bool(m.get("e2e")),
         client_id=m.get("client_id"),
+        expires_at=m.get("expires_at"),
         created_at=m["created_at"],
     )
 
@@ -93,18 +149,20 @@ async def list_messages(
     сообщения предыдущей страницы)."""
     if not await is_chat_member(chat_id, user["id"]):
         raise HTTPException(403, "Вы не участник этого чата")
+    now = utc_now()
     async with database.get_db() as db:
         sql = (
             "SELECT m.*, u.display_name AS sender_name "
             "FROM messages m "
             "JOIN users u ON u.id = m.sender_id "
-            "WHERE m.chat_id = :chat_id "
+            f"WHERE m.chat_id = :chat_id AND {_live_clause()} "
         )
-        params = {"chat_id": chat_id, "limit": limit + 1}
+        params = {"chat_id": chat_id, "fetch_n": limit + 1}
+        params.update(_live_params(now, now.strftime("%Y-%m-%d %H:%M:%S")))
         if before_id:
             sql += " AND m.id < :before_id"
             params["before_id"] = before_id
-        sql += " ORDER BY m.id DESC LIMIT :limit"
+        sql += " ORDER BY m.id DESC LIMIT :fetch_n"
 
         rows = await database.aq(db, sql, params)
 
@@ -150,17 +208,19 @@ async def search_messages(
                      "@@ plainto_tsquery('russian', :q)")
             params = {"chat_id": chat_id, "q": q_clean}
 
+        now = utc_now()
         sql = (
             "SELECT m.*, u.display_name AS sender_name "
             "FROM messages m "
             "JOIN users u ON u.id = m.sender_id "
-            f"WHERE m.chat_id = :chat_id AND {where} "
+            f"WHERE m.chat_id = :chat_id AND {where} AND {_live_clause()} "
         )
-        params["limit"] = limit + 1
+        params["fetch_n"] = limit + 1
+        params.update(_live_params(now, now.strftime("%Y-%m-%d %H:%M:%S")))
         if before_id:
             sql += " AND m.id < :before_id"
             params["before_id"] = before_id
-        sql += " ORDER BY m.id DESC LIMIT :limit"
+        sql += " ORDER BY m.id DESC LIMIT :fetch_n"
 
         rows = await database.aq(db, sql, params)
 
@@ -196,6 +256,8 @@ async def send_message(
         raise HTTPException(400, "Пустое сообщение")
 
     now = utc_now()
+    # v2.0 Пункт 2: точный абсолютный дедлайн физической смерти сообщения.
+    expires_at = now + timedelta(seconds=body.ttl_seconds) if body.ttl_seconds else None
     async with database.get_db() as db:
         # Идемпотентность (Этап 4.5): если client_id уже есть в чате —
         # возвращаем существующее сообщение, дубликат не создаётся.
@@ -210,15 +272,11 @@ async def send_message(
             if dup:
                 return _serialize_msg(dup)
 
-        try:
-            await db.execute(
-                sql_text(
-                    "INSERT INTO messages (chat_id, sender_id, type, content, media_path, "
-                    "duration, ttl_seconds, view_once, e2e, client_id, created_at) "
-                    "VALUES (:chat_id, :sender_id, :type, :content, :media_path, "
-                    ":duration, :ttl, :view_once, :e2e, :client_id, :created_at)"
-                ),
-                {
+        insert_sql = (
+            "INSERT INTO messages (chat_id, sender_id, type, content, media_path, "
+            "duration, ttl_seconds, view_once, e2e, client_id, created_at"
+        )
+        insert_params = {
                     "chat_id": chat_id,
                     "sender_id": user["id"],
                     "type": body.type,
@@ -226,12 +284,25 @@ async def send_message(
                     "media_path": body.media_path,
                     "duration": body.duration or 0,
                     "ttl": body.ttl_seconds,
+                    "expires_at": expires_at,
                     "view_once": 1 if body.view_once else 0,
                     "e2e": 1 if body.e2e else 0,
                     "client_id": body.client_id,
                     "created_at": now,
-                },
+                }
+        if expires_at is not None and _schema_has_expires_at():
+            # v2.0 Пункт 2: абсолютный дедлайн физической смерти сообщения.
+            insert_sql += ", expires_at"
+            insert_params["expires_at"] = expires_at
+        insert_sql += ") VALUES (" + ", ".join(
+            f":{k}" for k in (
+                ["chat_id", "sender_id", "type", "content", "media_path", "duration",
+                 "ttl", "view_once", "e2e", "client_id", "created_at"]
+                + (["expires_at"] if "expires_at" in insert_params else [])
             )
+        ) + ")"
+        try:
+            await db.execute(sql_text(insert_sql), insert_params)
         except IntegrityError:
             # Гонка двух параллельных отправок с одним client_id —
             # победитель уже записал; достаем его сообщение.
@@ -315,14 +386,30 @@ async def mark_viewed(message_id: int, user: dict = Depends(get_current_user)):
         m = await database.aq1(db, "SELECT * FROM messages WHERE id=:id", {"id": message_id})
         if not m:
             raise HTTPException(404, "Сообщение не найдено")
+        # v2.0 Пункт 2: истёкшее по TTL сообщение уже физически мертво —
+        # не отдаём его контент и не шлём статус прочтения, не дожидаясь
+        # следующего тика janitor'а (окно видимости = 0).
+        if _schema_has_expires_at() and m.get("expires_at") is not None \
+                and as_utc(m["expires_at"]) <= utc_now():
+            raise HTTPException(404, "Сообщение не найдено")
         if not await is_chat_member(m["chat_id"], user["id"]):
             raise HTTPException(403, "Нет доступа")
-        if m["view_once"] and not m["viewed"]:
+        was_unseen_view_once = bool(m["view_once"]) and not m["viewed"]
+        if was_unseen_view_once:
             await db.execute(sql_text("UPDATE messages SET viewed=1 WHERE id=:id"), {"id": message_id})
-            m = await database.aq1(db, "SELECT * FROM messages WHERE id=:id", {"id": message_id})
 
     payload = {"type": "message_viewed", "message_id": message_id, "chat_id": m["chat_id"]}
     await manager.send_to_user(m["sender_id"], payload)
+
+    if was_unseen_view_once:
+        async with database.get_db() as db:
+            members = [r["user_id"] for r in await database.aq(
+                db, "SELECT user_id FROM chat_members WHERE chat_id=:cid", {"cid": m["chat_id"]}
+            )]
+        await manager.send_to_users(
+            members,
+            {"type": "message_delete", "chat_id": m["chat_id"], "message_ids": [message_id]},
+        )
     return {"ok": True}
 
 

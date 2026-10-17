@@ -12,6 +12,7 @@ SMS / коды подтверждения не используются — ни
 - значимые события пишутся в audit-лог security_events (Этап 2.3).
 """
 import re
+import asyncio
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
@@ -111,10 +112,17 @@ async def register(body: RegisterRequest, request: Request):
         raise HTTPException(400, "Некорректное имя пользователя")
 
     role = "admin" if username == config.ADMIN_USERNAME.lower() else "user"
-    pw_hash = auth.hash_password(body.password)
+    # bcrypt выполняется ДО открытия транзакции: хеширование занимает
+    # сотни миллисекунд, и удержание write-локации SQLite на это время
+    # вызывало "database is locked" при конкурентной регистрации.
+    pw_hash = await asyncio.to_thread(auth.hash_password, body.password)
 
     # Атомарная регистрация (Этап 2.2): единственный INSERT опирается на
     # UNIQUE(username); гонка двойной регистрации ловится через IntegrityError.
+    # Транзакция открывается ПОСЛЕ хеширования и закрывается ДО записи
+    # audit-лога и выдачи токенов: при конкурентной регистрации это сводит
+    # время удержания write-локации SQLite к минимуму (дефект 'database is
+    # locked' под параллельными запросами).
     async with database.get_db() as db:
         try:
             await db.execute(
@@ -130,12 +138,20 @@ async def register(body: RegisterRequest, request: Request):
                 },
             )
         except IntegrityError:
-            await auth.log_security_event(
-                "register_conflict", username=username, ip=request.client.host if request.client else None,
-                detail="Попытка регистрации занятого username (гонка)",
-            )
-            raise HTTPException(400, "Такое имя уже занято — войдите")
-        user = await database.aq1(db, "SELECT * FROM users WHERE username=:username", {"username": username})
+            conflict = True
+        else:
+            user = await database.aq1(db, "SELECT * FROM users WHERE username=:username", {"username": username})
+            conflict = False
+
+    if conflict:
+        await auth.log_security_event(
+            "register_conflict", username=username, ip=request.client.host if request.client else None,
+            detail="Попытка регистрации занятого username (гонка)",
+        )
+        raise HTTPException(400, "Такое имя уже занято — войдите")
+
+    # Выдача токенов — отдельная короткая транзакция (refresh_tokens INSERT).
+    async with database.get_db() as db:
         tokens = await _issue_tokens(db, user["id"])
 
     await auth.log_security_event("register", user_id=user["id"], username=username,

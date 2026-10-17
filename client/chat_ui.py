@@ -93,6 +93,10 @@ class Message:
     text: str
     created_at: datetime = field(default_factory=_now_utc)
     edited_at: Optional[datetime] = None
+    # v2.0 Пункт 2: абсолютный момент физической смерти сообщения (tz-aware UTC).
+    # NULL => сообщение не сгорает. Используется локальным таймером-страховкой:
+    # даже если WS-событие message_delete потерялось, карточка исчезнет сама.
+    expires_at: Optional[datetime] = None
     status: MessageStatus = MessageStatus.SENDING
     reactions: dict[str, set[int]] = field(default_factory=dict)  # emoji -> user_ids
     reply_to_id: Optional[int] = None
@@ -115,6 +119,7 @@ class Message:
             text=raw.get("text", ""),
             created_at=_parse_ts(raw.get("created_at")),
             edited_at=_parse_ts(raw["edited_at"]) if raw.get("edited_at") else None,
+            expires_at=_parse_ts(raw["expires_at"]) if raw.get("expires_at") else None,
             status=status,
             reactions=reactions,
             reply_to_id=raw.get("reply_to_id"),
@@ -376,6 +381,152 @@ class SafetyNumberDialog(_DismissableDialog):
 # ---------------------------------------------------------------------------
 
 
+class TypingIndicator(ft.Container):
+    """Анимированный индикатор «[Имя] печатает...» (Material 3, v2.0 Пункт 9).
+
+    Лёгкий виджет под списком сообщений: три пульсирующие точки + подпись.
+    Автоскрытие: если за TYPING_AUTOHIDE_SECONDS (6 c, TTL серверного ключа)
+    не пришло ни одного обновляющего события по пользователю, виджет
+    бесшумно исчезает.
+    """
+
+    TYPING_AUTOHIDE_SECONDS = 6.0
+    _DOT_FRAMES = ("●○○", "○●○", "○○●")
+
+    def __init__(self, colors: dict):
+        super().__init__()
+        self._colors = colors
+        self._dots_lbl = ft.Text(self._DOT_FRAMES[0], size=13, color=colors["sub"])
+        self._caption = ft.Text("", size=13, style=ft.FontStyle(italic=True), color=colors["sub"])
+        self.visible = False
+        self.padding = ft.Padding(16, 2, 16, 2)
+        self.bgcolor = colors["surface"]
+        self.content = ft.Row([self._dots_lbl, self._caption], spacing=6)
+        # deadline по каждому печатающему пользователю: {user_id: loop_time+6}
+        self._deadlines: dict[int, float] = {}
+        self._names: dict[int, str] = {}
+        self._anim_task = None
+        self._hide_task = None
+
+    # --- API для ChatScreen -------------------------------------------------
+    def mark_typing(self, user_id: int, name: str) -> None:
+        """Отметить, что пользователь `name` печатает сейчас (сброс таймера)."""
+        import time as _time
+
+        self._deadlines[int(user_id)] = _time.monotonic() + self.TYPING_AUTOHIDE_SECONDS
+        self._names[int(user_id)] = name or f"user#{user_id}"
+        self._render_caption()
+        if not self.visible:
+            self.visible = True
+        self._start_anim()
+        self._schedule_hide()
+        self._safe_update()
+
+    def mark_stopped(self, user_id: int) -> None:
+        """Пользователь перестал печатать — скрыть немедленно, если он последний."""
+        self._deadlines.pop(int(user_id), None)
+        self._names.pop(int(user_id), None)
+        if not self._deadlines:
+            self._hide_now()
+        else:
+            self._render_caption()
+            self._safe_update()
+
+    def hide_all(self) -> None:
+        """Полный сброс (при отправке собственного сообщения / выходе из чата)."""
+        self._deadlines.clear()
+        self._names.clear()
+        self._hide_now()
+
+    # --- Внутренняя логика --------------------------------------------------
+    def _caption_text(self) -> str:
+        names = list(self._names.values())
+        if not names:
+            return ""
+        if len(names) == 1:
+            return f"{names[0]} печатает…"
+        if len(names) == 2:
+            return f"{names[0]} и {names[1]} печатают…"
+        return f"Ещё {len(names)} печатают…"
+
+    def _render_caption(self) -> None:
+        self._caption.value = self._caption_text()
+
+    def _hide_now(self) -> None:
+        self.visible = False
+        self._cancel_tasks()
+        self._safe_update()
+
+    def _safe_update(self) -> None:
+        try:
+            self.update()
+        except Exception:
+            pass  # контрол ещё не примонтирован к странице или страница закрыта
+
+    def _start_anim(self) -> None:
+        if self._anim_task is not None and not self._anim_task.done():
+            return
+        try:
+            self._anim_task = asyncio.ensure_future(self._animate())
+        except RuntimeError:
+            self._anim_task = None
+
+    async def _animate(self) -> None:
+        i = 0
+        try:
+            while self.visible and self._deadlines:
+                self._dots_lbl.value = self._DOT_FRAMES[i % 3]
+                i += 1
+                self._safe_update()
+                await asyncio.sleep(0.45)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+
+    def _schedule_hide(self) -> None:
+        if self._hide_task is not None and not self._hide_task.done():
+            self._hide_task.cancel()
+        try:
+            self._hide_task = asyncio.ensure_future(self._autohide_loop())
+        except RuntimeError:
+            self._hide_task = None
+
+    async def _autohide_loop(self) -> None:
+        """Каждые 0.5 с проверяем дедлайны; истёкшие молча убираем."""
+        import time as _time
+
+        try:
+            while True:
+                await asyncio.sleep(0.5)
+                if not self._deadlines:
+                    if self.visible:
+                        self._hide_now()
+                    return
+                now = _time.monotonic()
+                expired = [uid for uid, dl in self._deadlines.items() if dl <= now]
+                if expired:
+                    for uid in expired:
+                        self._deadlines.pop(uid, None)
+                        self._names.pop(uid, None)
+                    if not self._deadlines:
+                        self._hide_now()
+                        return
+                    self._render_caption()
+                    self._safe_update()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+
+    def _cancel_tasks(self) -> None:
+        for task in (self._anim_task, self._hide_task):
+            if task is not None and not task.done():
+                task.cancel()
+        self._anim_task = None
+        self._hide_task = None
+
+
 class ChatScreen:
     """Экран чата с полным набором UX-фич Этапа 7.3.
 
@@ -394,6 +545,13 @@ class ChatScreen:
         self._draft_tx: str = ""
         self._ws_task: Optional[asyncio.Task] = None
         self._menu: Optional[ft.Control] = None
+        # v2.0 Пункт 9: debounce-контроллер отправки client_typing
+        self._last_typing_emit: float = 0.0
+        self._typing_stop_task: Optional[asyncio.Task] = None
+        self.typing_indicator: Optional["TypingIndicator"] = None
+        # v2.0 Пункт 2: локальные таймеры-страховки по expires_at
+        # (если WS-событие message_delete потерялось — карточка сгорит сама).
+        self._burn_tasks: dict[int, asyncio.TimerHandle] = {}
 
     @property
     def page(self) -> ft.Page:
@@ -430,6 +588,9 @@ class ChatScreen:
 
         self.list_view = ft.ListView(expand=True, spacing=6, reverse=False, auto_scroll=True)
 
+        # v2.0 Пункт 9: анимированный индикатор «печатает…» под списком сообщений
+        self.typing_indicator = TypingIndicator(c)
+
         self.input = ft.TextField(
             hint_text="Сообщение…",
             expand=True,
@@ -438,6 +599,7 @@ class ChatScreen:
             max_lines=5,
             shift_enter=True,
             on_submit=lambda e: asyncio.ensure_future(self.send_current_message()),
+            on_change=self.on_input_change,
         )
         self.reply_preview = ReplyPreview(c, on_cancel=self.cancel_reply)
 
@@ -459,7 +621,9 @@ class ChatScreen:
                 spacing=4,
             ),
         )
-        self.root = ft.Column([header, self.list_view, composer], expand=True, spacing=0)
+        self.root = ft.Column(
+            [header, self.list_view, self.typing_indicator, composer], expand=True, spacing=0
+        )
         await self.load_history()
         return self.root
 
@@ -467,9 +631,18 @@ class ChatScreen:
 
     async def load_history(self) -> None:
         raw = await self._api_messages()
-        self.messages = [Message.from_server(m, self.my_id) for m in raw]
+        now = _now_utc()
+        # v2.0 Пункт 2: страховка на случай потерянного message_delete —
+        # истёкшие сообщения не рендерим и снимаем с них локальные таймеры.
+        self.messages = [
+            Message.from_server(m, self.my_id)
+            for m in raw
+            if not (m.get("expires_at") and _parse_ts(m["expires_at"]) <= now)
+        ]
         self.index_by_id = {m.id: m for m in self.messages if m.id is not None}
         self._render_all()
+        for msg in self.messages:
+            self._schedule_burn(msg)
 
     async def _api_messages(self) -> list[dict]:
         return await self.app.api.messages(self.chat_id, limit=100)
@@ -722,28 +895,96 @@ class ChatScreen:
 
     # ==================== Статусы (WS) ====================
 
-    def attach_ws(self, listen_coro_factory: Callable[..., Awaitable[None]]) -> None:
-        """Подключает обработчик WS-событий (sent/delivered/read/react/edited).
+    # ---------- v2.0 Пункт 9: Debounce-контроллер «печатает» ----------
+    TYPING_DEBOUNCE_SECONDS = 2.0     # не чаще одного client_typing в 2 секунды
+    TYPING_STOP_DELAY_SECONDS = 5.0   # «перестал печатать» после паузы ввода
 
-        ``listen_coro_factory`` возвращает корутину (например, api.ws_listen),
-        которая вызывает self.handle_event для каждого события.
+    def on_input_change(self, e) -> None:
+        """on_change TextField: троттлинг отправки client_typing по WebSocket.
+
+        Событие уходит не чаще раза в TYPING_DEBOUNCE_SECONDS; каждое
+        изменение текста перезапускает таймер stop-события. Полностью
+        асинхронно и без исключений наружу — UX-фича best-effort.
         """
-        if self._ws_task and not self._ws_task.done():
-            self._ws_task.cancel()
-        self._ws_task = asyncio.ensure_future(self._ws_loop(listen_coro_factory))
+        text = (self.input.value or "")
+        now = time.monotonic()
+        if not text.strip():
+            # Черновик пуст — немедленно шлём stop (он не лимитится сервером).
+            self._last_typing_emit = 0.0
+            self._cancel_stop_timer()
+            asyncio.ensure_future(self._send_typing_event(""))
+            return
+        if now - self._last_typing_emit >= self.TYPING_DEBOUNCE_SECONDS:
+            self._last_typing_emit = now
+            asyncio.ensure_future(self._send_typing_event(text))
+        self._restart_stop_timer()
 
-    async def _ws_loop(self, factory) -> None:
-        while True:
-            try:
-                await factory(self.handle_event)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                await asyncio.sleep(2)  # автопереподключение
+    async def _send_typing_event(self, text: str) -> None:
+        try:
+            await self.app.api.ws_send({
+                "type": "client_typing",
+                "chat_id": self.chat_id,
+                "text": text,
+            })
+        except Exception:
+            pass  # WS ещё не поднят / сеть упала — молча деградируем
 
-    async def handle_event(self, ev: dict) -> None:
-        kind = ev.get("type")
-        msg_id = ev.get("message_id")
+    def _restart_stop_timer(self) -> None:
+        self._cancel_stop_timer()
+        self._typing_stop_task = asyncio.ensure_future(self._typing_stop_later())
+
+    def _handle_typing_event(self, ev: dict) -> None:
+        """WS-событие user_typing от бэкенда (v2.0 Пункт 9)."""
+        if int(ev.get("chat_id", -1)) != self.chat_id:
+            return
+        uid = int(ev.get("user_id", 0))
+        if not uid or uid == self.my_id:
+            return
+        indicator = getattr(self, "typing_indicator", None)
+        if indicator is None:
+            return
+        if ev.get("typing"):
+            indicator.mark_typing(uid, self._author_name(uid))
+        else:
+            indicator.mark_stopped(uid)
+
+    # ---------- Таймер «перестал печатать» (v2.0 Пункт 9) ----------
+    async def _typing_stop_later(self) -> None:
+        """Через TYPING_STOP_DELAY_SECONDS бездействия шлём stop-событие.
+
+        Задача отменяется через _cancel_stop_timer при каждом новом вводе,
+        поэтому событие уходит ровно один раз на паузу печати.
+        """
+        try:
+            await asyncio.sleep(self.TYPING_STOP_DELAY_SECONDS)
+            await self._send_typing_event("")
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            pass
+
+    def _cancel_stop_timer(self) -> None:
+        task = getattr(self, "_typing_stop_task", None)
+        if task is not None and not task.done():
+            task.cancel()
+        self._typing_stop_task = None
+
+    # ==================== Диспетчер WS-событий ====================
+
+    def handle_event(self, ev: dict) -> None:
+        """Роутер входящих WebSocket-событий для активного экрана чата."""
+        etype = ev.get("type")
+        if etype == "ping":
+            return
+        if etype == "user_typing":
+            self._handle_typing_event(ev)
+            return
+        if etype != "message_status" and etype != "message":
+            # Фолбэк: часть событий приходит плоским payload'ом из ws_manager.
+            if "status" not in ev and etype not in ("react", "edited", "reaction"):
+                return
+        kind = ev.get("kind") or etype
+        msg_id = ev.get("message_id") or ev.get("id")
         if kind in ("delivered", "read"):
             m = self.index_by_id.get(int(msg_id)) if msg_id else None
             if m is None:
