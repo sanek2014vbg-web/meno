@@ -44,12 +44,11 @@ class ApiClient:
         self.refresh_token: Optional[str] = None
         self.user: Optional[dict] = None
         self._create_session()
-        # Восстанавливаем токены из изолированного хранилища
+        # Восстанавливаем токен авторизации из изолированного хранилища
         if username:
-            tokens = crypto.vault_load_tokens(username)
-            if tokens:
-                self.token = tokens.get("access")
-                self.refresh_token = tokens.get("refresh")
+            saved = crypto.vault_load_token(username)
+            if saved:
+                self.token = saved
 
     # ---------- Управление сессией ----------
     def _create_session(self) -> None:
@@ -101,10 +100,7 @@ class ApiClient:
                     if success:
                         self.token = new_tokens["access_token"]
                         self.refresh_token = new_tokens.get("refresh_token", self.refresh_token)
-                        crypto.vault_save_tokens(self.username, {
-                            "access": self.token, 
-                            "refresh": self.refresh_token
-                        })
+                        crypto.vault_save_token(self.username, self.token)
                         # Повторяем запрос с новым токеном
                         r = await self._http.request(
                             method, self.base_url + path, headers=self._headers(), **kw
@@ -113,7 +109,7 @@ class ApiClient:
                         # Обновить не удалось - разлогиниваемся
                         self.token = None
                         self.refresh_token = None
-                        crypto.vault_clear_tokens(self.username)
+                        crypto.vault_remove_token(self.username)
                         raise ApiError(401, "Сессия истекла, пожалуйста, войдите снова")
 
             except httpx.TransportError as exc:
@@ -166,10 +162,7 @@ class ApiClient:
         self.refresh_token = tokens["refresh_token"]
         self.user = data["user"]
         self.username = username
-        crypto.vault_save_tokens(username, {
-            "access": self.token, 
-            "refresh": self.refresh_token
-        })
+        crypto.vault_save_token(username, self.token)
         return data
 
     async def login(self, username: str, password: str, totp: str = "") -> dict:
@@ -182,10 +175,7 @@ class ApiClient:
         self.refresh_token = tokens["refresh_token"]
         self.user = data["user"]
         self.username = username
-        crypto.vault_save_tokens(username, {
-            "access": self.token, 
-            "refresh": self.refresh_token
-        })
+        crypto.vault_save_token(username, self.token)
         return data
 
     async def logout(self) -> dict:
@@ -198,7 +188,7 @@ class ApiClient:
             pass
         self.token = None
         self.refresh_token = None
-        crypto.vault_clear_tokens(self.username)
+        crypto.vault_remove_token(self.username)
         return {"ok": True}
 
     async def me(self) -> dict:
