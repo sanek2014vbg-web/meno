@@ -33,6 +33,7 @@ from server.routes_auth import router as auth_router
 from server.routes_chats import router as chats_router
 from server.routes_files import router as files_router
 from server.routes_messages import router as messages_router
+from server.routes_reactions import router as reactions_router
 from server.ws_manager import manager
 
 setup_logging()
@@ -169,6 +170,7 @@ async def access_log(request: Request, call_next):
 fastapi_app.include_router(auth_router)
 fastapi_app.include_router(chats_router)
 fastapi_app.include_router(messages_router)
+fastapi_app.include_router(reactions_router)
 fastapi_app.include_router(files_router)
 fastapi_app.include_router(admin_router)
 

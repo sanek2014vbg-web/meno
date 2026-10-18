@@ -54,6 +54,51 @@ def _schema_has_expires_at() -> bool:
 _EXPIRES_AT_OK: bool | None = None
 
 
+def _schema_has_reply_to() -> bool:
+    """Есть ли в реальной схеме БД колонка messages.reply_to_id (Этап 7.4).
+
+    Тот же легаси-паттерн, что и _schema_has_expires_at: БД, созданные до
+    миграции c8d9e0f1a2b3, не имеют колонок ответов/реакций — INSERT с явным
+    reply_to_id на них упал бы с 'no such column' (500). Кэш на процесс.
+    """
+    global _REPLY_TO_OK
+    if _REPLY_TO_OK is None:
+        try:
+            from sqlalchemy import inspect as sa_inspect
+
+            with engine.sync_engine.connect() as conn:
+                cols = {c["name"] for c in sa_inspect(conn).get_columns("messages")}
+            _REPLY_TO_OK = "reply_to_id" in cols
+        except Exception:  # инспектор недоступен — считаем схему полной
+            _REPLY_TO_OK = True
+    return _REPLY_TO_OK
+
+
+_REPLY_TO_OK: bool | None = None
+
+_REACTIONS_TABLE_OK: bool | None = None
+
+
+def _reactions_table_exists() -> bool:
+    """Есть ли в реальной схеме БД таблица reactions (Этап 7.4).
+
+    Тот же легаси-паттерн, что и _schema_has_reply_to: на БД, созданных до
+    миграции c8d9e0f1a2b3, DELETE FROM reactions упал бы с 'no such table'.
+    Результат кэшируется на процесс.
+    """
+    global _REACTIONS_TABLE_OK
+    if _REACTIONS_TABLE_OK is None:
+        try:
+            from sqlalchemy import inspect as sa_inspect
+
+            with engine.sync_engine.connect() as conn:
+                tables = set(sa_inspect(conn).get_table_names())
+            _REACTIONS_TABLE_OK = "reactions" in tables
+        except Exception:  # инспектор недоступен — считаем схему полной
+            _REACTIONS_TABLE_OK = True
+    return _REACTIONS_TABLE_OK
+
+
 def _live_clause() -> str:
     """SQL-предикат «сообщение ещё живо» или заглушка для легаси-схемы."""
     return _LIVE_CLAUSE if _schema_has_expires_at() else "1=1"
@@ -70,6 +115,12 @@ class SendMessageRequest(BaseModel):
     client_id: Optional[str] = Field(
         default=None, min_length=8, max_length=64,
         description="Идемпотентный ключ клиента: повторная отправка не создаст дубликат",
+    )
+    # --- Этап 7.4: Ответы (Replies/Quotes) ---
+    reply_to_id: Optional[int] = Field(
+        default=None, ge=1,
+        description="id сообщения-оригинала в ЭТОМ ЖЕ чате; "
+                    "валидируется на сервере (существование + принадлежность чату)",
     )
 
 
@@ -91,6 +142,9 @@ class MessageResponse(BaseModel):
     status: str = "sent"
     delivered_at: Optional[object] = None
     read_at: Optional[object] = None
+    # --- Этап 7.4: Ответы и Реакции ---
+    reply_to_id: Optional[int] = None
+    reactions: dict = Field(default_factory=dict)
     # v2.0 Пункт 2: абсолютный момент физической смерти сообщения (tz-aware UTC).
     # Клиент использует его для локального таймера автоудаления карточки —
     # даже если WS-событие message_delete потерялось (обход прокси и т.п.).
@@ -124,7 +178,7 @@ def _live_params(now, now_text: str) -> dict:
     return {"now": now, "now_text": now_text}
 
 
-def _serialize_msg(m: dict) -> MessageResponse:
+def _serialize_msg(m: dict, reactions: Optional[dict] = None) -> MessageResponse:
     return MessageResponse(
         id=m["id"],
         chat_id=m["chat_id"],
@@ -146,9 +200,39 @@ def _serialize_msg(m: dict) -> MessageResponse:
         else str(m["status"]),
         delivered_at=m.get("delivered_at"),
         read_at=m.get("read_at"),
+        # Этап 7.4: ответы и реакции (легаси-схемы без колонок -> дефолты).
+        reply_to_id=m.get("reply_to_id"),
+        reactions=reactions if reactions is not None else {},
         expires_at=m.get("expires_at"),
         created_at=m["created_at"],
     )
+
+
+async def fetch_reactions_batch(message_ids: List[int]) -> dict:
+    """Batch-load реакций страницы истории — ОДИН запрос вместо N (анти-N+1).
+
+    Возвращает {message_id: summary-dict}; сообщения без реакций просто
+    отсутствуют в словаре (_serialize_msg подставит пустой {}).
+    Диалект-безопасно: динамические bind-плейсхолдеры (:m0, :m1...) работают
+    одинаково на SQLite и PostgreSQL 16; пустой вход не делает round-trip.
+    """
+    if not message_ids:
+        return {}
+    placeholders = ", ".join(f":m{i}" for i in range(len(message_ids)))
+    params = {f"m{i}": mid for i, mid in enumerate(message_ids)}
+    async with database.get_db() as db:
+        rows = await database.aq(
+            db,
+            f"SELECT message_id AS mid, user_id AS uid, encrypted_payload AS payload "
+            f"FROM reactions WHERE message_id IN ({placeholders}) "
+            f"ORDER BY message_id, user_id",
+            params,
+        )
+    grouped: dict = {}
+    for r in rows:
+        per_msg = grouped.setdefault(r["mid"], {})
+        per_msg.setdefault(r["payload"], []).append(r["uid"])
+    return grouped
 
 
 @router.get("/chats/{chat_id}/messages", response_model=MessagesListResponse)
@@ -183,7 +267,12 @@ async def list_messages(
     page = rows[:limit]
     if not page:
         return MessagesListResponse(messages=[], next_cursor=None, has_more=False)
-    messages = [_serialize_msg(m) for m in reversed(page)]
+    # Анти-N+1 (Этап 7.4): реакции всей страницы — ОДНИМ batch-запросом IN (:ids).
+    reactions_map = await fetch_reactions_batch([m["id"] for m in page])
+    messages = [
+        _serialize_msg(m, reactions=reactions_map.get(m["id"], {}))
+        for m in reversed(page)
+    ]
     return MessagesListResponse(
         messages=messages,
         next_cursor=page[-1]["id"] if has_more else None,
@@ -268,6 +357,19 @@ async def send_message(
     if not body.content and not body.media_path:
         raise HTTPException(400, "Пустое сообщение")
 
+    # --- Этап 7.4: валидация ответа (Replies/Quotes) ---
+    # Бизнес-правило: оригинал обязан существовать и лежать в ЭТОМ ЖЕ чате.
+    # Без проверки chat_id клиент мог бы «прицепить» reply к сообщению из
+    # чужого чата — утечка метаданных между приватными пространствами.
+    if body.reply_to_id is not None:
+        async with database.get_db() as db:
+            original = await database.aq1(
+                db, "SELECT id FROM messages WHERE id=:id AND chat_id=:cid",
+                {"id": body.reply_to_id, "cid": chat_id},
+            )
+        if not original:
+            raise HTTPException(400, "Сообщение для ответа не найдено в этом чате")
+
     now = utc_now()
     # v2.0 Пункт 2: точный абсолютный дедлайн физической смерти сообщения.
     expires_at = now + timedelta(seconds=body.ttl_seconds) if body.ttl_seconds else None
@@ -285,36 +387,39 @@ async def send_message(
             if dup:
                 return _serialize_msg(dup)
 
-        insert_sql = (
-            "INSERT INTO messages (chat_id, sender_id, type, content, media_path, "
-            "duration, ttl_seconds, view_once, e2e, client_id, created_at"
-        )
-        # Дефект-фикс: ранее в dict входил ключ "ttl", а в списке колонок — "ttl_seconds";
-        # при expires_at=None получалось 12 плейсхолдеров на 11 колонок.
-        # Ключи params теперь строго соответствуют колонкам + ":name"-плейсхолдерам.
+        # Скобка после "INSERT INTO messages (" закрыта ниже, когда список
+        # колонок собран целиком — раньше хвост шаблона сливался с первым
+        # именем из columns и получался мусорный колонка-идентификатор.
+        insert_sql = "INSERT INTO messages ("
+        # Дефект-фикс (Этап 7.4): список колонок и порядок VALUES собираются из
+        # ОДНОГО упорядоченного dict — раньше "created_at" попадал в колонки
+        # раньше reply_to_id/expires_at, а плейсхолдеры строились по другому
+        # порядку, и SQLite связывал параметры позиционно: datetime из
+        # created_at уходил в колонку reply_to_id -> FOREIGN KEY constraint
+        # failed / ValidationError 'unable to parse string as an integer'.
         insert_params = {
-                    "chat_id": chat_id,
-                    "sender_id": user["id"],
-                    "type": body.type,
-                    "content": body.content.strip(),
-                    "media_path": body.media_path,
-                    "duration": body.duration or 0,
-                    "ttl_seconds": body.ttl_seconds,
-                    "view_once": 1 if body.view_once else 0,
-                    "e2e": 1 if body.e2e else 0,
-                    "client_id": body.client_id,
-                    "created_at": now,
-                }
+            "chat_id": chat_id,
+            "sender_id": user["id"],
+            "type": body.type,
+            "content": body.content.strip(),
+            "media_path": body.media_path,
+            "duration": body.duration or 0,
+            "ttl_seconds": body.ttl_seconds,
+            "view_once": 1 if body.view_once else 0,
+            "e2e": 1 if body.e2e else 0,
+            "client_id": body.client_id,
+            "created_at": now,
+        }
+        # Колонку reply_to_id добавляет миграция c8d9e0f1a2b3 — на легаси-схемах
+        # её нет, поэтому включаем в INSERT только при наличии колонки.
+        if _schema_has_reply_to():
+            insert_params["reply_to_id"] = body.reply_to_id
         if expires_at is not None and _schema_has_expires_at():
             # v2.0 Пункт 2: абсолютный дедлайн физической смерти сообщения.
-            insert_sql += ", expires_at"
             insert_params["expires_at"] = expires_at
-        insert_sql += ") VALUES (" + ", ".join(
-            f":{k}" for k in (
-                ["chat_id", "sender_id", "type", "content", "media_path", "duration",
-                 "ttl_seconds", "view_once", "e2e", "client_id", "created_at"]
-                + (["expires_at"] if "expires_at" in insert_params else [])
-            )
+        columns = list(insert_params)
+        insert_sql += ", ".join(columns) + ") VALUES (" + ", ".join(
+            f":{k}" for k in columns
         ) + ")"
         try:
             await db.execute(sql_text(insert_sql), insert_params)
@@ -356,7 +461,10 @@ async def send_message(
         )]
         sender_label = msg["sender_name"]
 
-    payload = {"type": "new_message", "message": _serialize_msg(msg)}
+    # Реакции не запрашиваем batch'ом: у свежего сообщения их быть не может
+    # (FK на messages.id + только что созданный id) — пустой словарь экономит
+    # один round-trip к БД в горячем пути отправки.
+    payload = {"type": "new_message", "message": _serialize_msg(msg, reactions={})}
 
     # Доставка ПОСЛЕ коммита транзакции (get_db делает commit на выходе):
     await manager.send_to_users(members, payload)
@@ -572,6 +680,19 @@ async def delete_message(message_id: int, user: dict = Depends(get_current_user)
             raise HTTPException(404, "Сообщение не найдено")
         if m["sender_id"] != user["id"]:
             raise HTTPException(403, "Удалять можно только свои сообщения")
+        # Диалект-безопасный каскад: явную очистку зависимостей выполняем ДО удаления
+        # строки, потому что SQLite по умолчанию работает с выключенным
+        # PRAGMA foreign_keys и FK-правила SET NULL / CASCADE молча не сработают.
+        # На PostgreSQL эти же запросы идемпотентны и лишь дублируют каскад БД.
+        if _schema_has_reply_to():
+            await db.execute(
+                sql_text("UPDATE messages SET reply_to_id=NULL WHERE reply_to_id=:id"),
+                {"id": message_id},
+            )
+        if _reactions_table_exists():
+            await db.execute(
+                sql_text("DELETE FROM reactions WHERE message_id=:id"), {"id": message_id}
+            )
         await db.execute(sql_text("DELETE FROM messages WHERE id=:id"), {"id": message_id})
         members = [r["user_id"] for r in await database.aq(
             db, "SELECT user_id FROM chat_members WHERE chat_id=:cid", {"cid": m["chat_id"]}

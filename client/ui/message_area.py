@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import math
 import time
 import uuid
 from typing import Awaitable, Callable, Optional
@@ -26,12 +27,13 @@ import themes
 from ui.message_model import (
     QUICK_REACTIONS,
     SAFETY_NUMBER_GROUPS,
-    STATUS_GLYPH,
     Message,
     MessageStatus,
     _fmt_time,
     _now_utc,
     _parse_ts,
+    apply_reaction_summary,
+    encrypt_reaction_payload,
     next_status,
     status_icon,
     status_icon_color,
@@ -156,7 +158,16 @@ class EditDialog(_DismissableDialog):
 
 
 class ReactionPicker(_DismissableDialog):
-    """Поп-овер выбора быстрой реакции на сообщение."""
+    """Веер-радар быстрых реакций (Спринт 3 «Reaxions»).
+
+    Короткий тап по пузырю — мгновенный 👍 (в ChatScreen._end_swipe),
+    длинный тап открывает этот радар: 6 эмодзи раскрываются дугой вокруг
+    сообщения; выбор шлёт optimistic-toggle с E2EE blob'ом.
+    """
+
+    #: Углы раскрытия «веера» — от -75° до +75° относительно горизонтали.
+    FAN_ANGLES = (-75, -45, -15, 15, 45, 75)
+    FAN_RADIUS = 96.0
 
     def __init__(
         self, message: Message, on_pick: Callable[[str], Awaitable[None]], colors: dict
@@ -174,9 +185,26 @@ class ReactionPicker(_DismissableDialog):
             )
             for emoji in QUICK_REACTIONS
         ]
+        # Веер: каждый эмодзи смещён вдоль своей дуги (sin/cos — чистая
+        # математика без аллокаций, O(len(QUICK_REACTIONS)) один раз при открытии).
+        fan: list[ft.Control] = []
+        for i, btn in enumerate(buttons):
+            angle_deg = self.FAN_ANGLES[i % len(self.FAN_ANGLES)]
+            rad = math.radians(angle_deg)
+            dx = self.FAN_RADIUS * math.cos(rad)
+            dy = -self.FAN_RADIUS * math.sin(rad)  # экранные Y инвертированы
+            fan.append(
+                ft.Container(
+                    content=btn,
+                    translate=ft.Transform.translate(dx, dy),
+                    animate_transform=ft.Animation(
+                        250, ft.AnimationCurve.EASE_OUT_BACK
+                    ),
+                )
+            )
         self.dialog = ft.AlertDialog(
             title=ft.Text("Реакция", size=14),
-            content=ft.Row(buttons, wrap=True, alignment=ft.MainAxisAlignment.CENTER),
+            content=ft.Stack(fan, width=260, height=180),
             actions=[ft.TextButton("Убрать все", on_click=self._clear)],
         )
 
@@ -324,7 +352,9 @@ class MessageRow(ft.Container):
     Flet не блокируется сетевыми/WS-событиями.
     """
 
-    def __init__(self, message: Message, mine: bool, colors: dict, screen: "ChatScreen"):
+    def __init__(
+        self, message: Message, mine: bool, colors: dict, screen: "ChatScreen"
+    ):
         super().__init__()
         self.message = message
         self.mine = mine
@@ -390,6 +420,11 @@ class MessageRow(ft.Container):
         self.content = ft.GestureDetector(
             on_tap_down=lambda e: self._screen._on_bubble_tap(e, self.message),
             on_long_press=lambda e: self._screen._open_context(self.message),
+            # Спринт 3 «Reaxions»: свайп по пузырю — мгновенная быстрая реакция.
+            # Свайпы активны только когда экран не в режиме ответа (reply_target
+            # занят цитатой) и у сообщения есть id (черновики не реагируем).
+            on_horizontal_drag_start=self._on_drag_start,
+            on_horizontal_drag_end=self._on_drag_end,
             content=bubble,
         )
         self.alignment = (
@@ -438,7 +473,9 @@ class MessageRow(ft.Container):
         self.message.text = text
         self.message.edited_at = edited_at
         if edited_at is not None and self._edited_lbl is None:
-            self._edited_lbl = ft.Text("(ред.)", size=10, italic=True, color=self._colors["sub"])
+            self._edited_lbl = ft.Text(
+                "(ред.)", size=10, italic=True, color=self._colors["sub"]
+            )
             row = ft.Row([self._body, self._edited_lbl], spacing=4, tight=True)
             col = self.content.content.content
             for i, ctl in enumerate(col.controls):
@@ -462,15 +499,33 @@ class MessageRow(ft.Container):
             self._reply_text.value = preview
         elif preview and self._reply_box is None:
             self.message.reply_preview = preview
-            self._reply_text = ft.Text(preview, size=11, color=self._colors["sub"],
-                                       max_lines=1, overflow=ft.TextOverflow.ELLIPSIS)
+            self._reply_text = ft.Text(
+                preview,
+                size=11,
+                color=self._colors["sub"],
+                max_lines=1,
+                overflow=ft.TextOverflow.ELLIPSIS,
+            )
             self._reply_box = ft.Container(
                 padding=ft.Padding(8, 4, 8, 4),
                 border=ft.border.only(left=ft.BorderSide(3, self._colors["accent"])),
-                bgcolor="#00000010", border_radius=4, content=self._reply_text)
+                bgcolor="#00000010",
+                border_radius=4,
+                content=self._reply_text,
+            )
             col = self.content.content.content
             insert_at = 1 if self._author_lbl is not None else 0
             col.controls.insert(insert_at, self._reply_box)
+
+    # ---------- Свайп-реакции (Спринт 3 «Reaxions») ----------
+
+    def _on_drag_start(self, e: ft.DragStartEvent) -> None:
+        """Фиксируем старт горизонтального свайпа (для дедупликации жеста)."""
+        self._screen._begin_swipe(self.message, e)
+
+    def _on_drag_end(self, e: ft.DragEndEvent) -> None:
+        """Завершение свайпа: экран решает, отправлять ли быструю реакцию."""
+        self._screen._end_swipe(self.message, e)
 
 
 # ---------------------------------------------------------------------------
@@ -654,6 +709,17 @@ class ChatScreen:
         # (повторный delivered/read за одну сессию экрана не уйдёт в сеть).
         self._delivered_acked: set[int] = set()
         self._read_acked: set[int] = set()
+        # Спринт 3 «Reaxions»: E2E-ключ чата (X25519+HKDF) для де/шифрования
+        # blob'ов реакций; None => чат без E2E (реакции не шифруются сервером
+        # осмысленно — UI просто не покажет эмодзи из чужих blob'ов).
+        self.e2e_key: Optional[bytes] = None
+        #: Дедупликация свайп-жеста: message_id -> момент последнего принятого
+        #: свайпа (SWIPE_DEDUPE_SECONDS). Защита от двойного POST при дрожи.
+        self._last_swipe_at: dict[int, float] = {}
+
+    # ---------- Константы жестов (Спринт 3 «Reaxions») ----------
+    SWIPE_DEDUPE_SECONDS = 0.8  # минимум между двумя свайп-реакциями одного id
+    SWIPE_MIN_DELTA_PX = 40.0  # смещение, отделяющее свайп от случайного сдвига
 
     @property
     def page(self) -> ft.Page:
@@ -677,6 +743,7 @@ class ChatScreen:
     # ==================== Сборка UI ====================
 
     async def build(self) -> ft.Control:
+        await self._setup_e2e()  # Спринт 3: ключ чата нужен для де/шифрования реакций
         c = self.c
         self.title_lbl = ft.Text(
             self.chat.get("title", "Чат"), size=18, weight=ft.FontWeight.W_600
@@ -750,6 +817,29 @@ class ChatScreen:
 
     # ==================== Данные ====================
 
+    async def _setup_e2e(self) -> None:
+        """Derive общего ключа чата (X25519 + HKDF) для E2EE-реакций.
+
+        Логика идентична screens/chat_view.py::_setup_e2e: приватный ключ
+        берём из локального хранилища, публичный — у собеседника. При
+        отсутствии любой стороны e2e_key остаётся None — чат работает без
+        шифрования реакций (эмодзи от других клиентов не дешифруются и
+        молча не отображаются, UI не падает).
+        """
+        self.e2e_key = None
+        if self.chat.get("type") != "private":
+            return
+        priv = getattr(self.app, "e2e_priv", None)
+        if not priv:
+            return
+        peer_pub, _error = await self._api_peer_pubkey()
+        if not peer_pub:
+            return
+        try:
+            self.e2e_key = crypto.derive_chat_key(priv, peer_pub)
+        except Exception:
+            self.e2e_key = None
+
     async def load_history(self) -> None:
         raw = await self._api_messages()
         now = _now_utc()
@@ -761,6 +851,7 @@ class ChatScreen:
             if not (m.get("expires_at") and _parse_ts(m["expires_at"]) <= now)
         ]
         self.index_by_id = {m.id: m for m in self.messages if m.id is not None}
+        await self._load_reaction_summaries()
         # Этап 7.3: ACK «delivered» для входящих, ещё не доставленных серверу.
         for msg in self.messages:
             if msg.sender_id != self.my_id and msg.id is not None:
@@ -768,6 +859,25 @@ class ChatScreen:
         self._render_all()
         for msg in self.messages:
             self._schedule_burn(msg)
+
+    async def _load_reaction_summaries(self) -> None:
+        """Batch-load реакций страницы ОДНИМ запросом (анти-N+1, Спринт 3).
+
+        Сервер отдаёт summary вида {message_id: {blob: [user_id,...]}};
+        эмодзи расшифровывается локальным ключом чата. Ошибки сети не должны
+        ломать загрузку истории — реакции просто останутся пустыми.
+        """
+        ids = [m.id for m in self.messages if m.id is not None]
+        if not ids:
+            return
+        try:
+            grouped = await self.app.api.chat_reactions(self.chat_id, ids)
+        except Exception:
+            return
+        for mid, summary in grouped.items():
+            m = self.index_by_id.get(int(mid))
+            if m is not None:
+                apply_reaction_summary(m, summary, self.e2e_key)
 
     async def _api_messages(self) -> list[dict]:
         return await self.app.api.messages(self.chat_id, limit=100)
@@ -780,17 +890,15 @@ class ChatScreen:
     async def _api_edit(self, message_id: int, text: str) -> dict:
         return await self.app.api.edit_message(message_id, text)
 
-    async def _api_react(self, message_id: int, emoji: str) -> dict:
-        return await self.app.api.react_message(message_id, emoji)
+    async def _api_react(self, message_id: int, payload: str) -> dict:
+        return await self.app.api.toggle_reaction(message_id, payload)
 
     async def _api_read(self, message_id: int) -> dict:
         return await self.app.api.mark_viewed(message_id)
 
     async def _api_status(self, message_id: int, status: str, ghost: bool) -> dict:
         """PATCH /messages/{id}/status — единая точка ACK статусов (Этап 7.3)."""
-        return await self.app.api.update_message_status(
-            message_id, status, ghost=ghost
-        )
+        return await self.app.api.update_message_status(message_id, status, ghost=ghost)
 
     async def _api_peer_pubkey(self) -> tuple[Optional[str], Optional[str]]:
         """Возвращает (pubkey, error) публичный ключ собеседника для приватного чата."""
@@ -897,18 +1005,95 @@ class ChatScreen:
         self.reply_preview.clear()
 
     async def toggle_reaction(self, emoji: str) -> None:
+        """Выбор из радара/меню: мгновенный optimistic-UI + E2EE POST.
+
+        Порядок (Спринт 3): сначала локально меняем набор реакций и
+        перерисовываем ряд (отклик <1 кадра), только затем уходим в сеть с
+        зашифрованным blob'ом эмодзи. Ответ сервера — источник истины:
+        применяем его summary; при ошибке откатываем оптимистичное изменение.
+        """
         target = self.reply_target
         if target is None or target.id is None:
             return
+        await self._apply_reaction(target, emoji)
+
+    async def _apply_reaction(self, m: Message, emoji: str) -> None:
+        """Оптимистичный toggle одной реакции для конкретного сообщения.
+
+        E2EE-инвариант (Спринт 3): в сеть уходит только AES-GCM blob эмодзи,
+        зашифрованный ключом чата — сервер не знает, какой именно смайл
+        стоит. В чатах без общего ключа быстрые реакции запрещены: иначе
+        эмодзи утёк бы серверу открытым текстом (см. _begin_swipe/_end_swipe).
+        """
+        if m.id is None:
+            return
+        snapshot = {k: set(v) for k, v in m.reactions.items()}  # для отката
+        if emoji:
+            bucket = m.reactions.setdefault(emoji, set())
+            if self.my_id in bucket:
+                bucket.discard(self.my_id)  # повторный выбор = снятие
+            else:
+                bucket.add(self.my_id)
+        else:
+            for users in m.reactions.values():
+                users.discard(self.my_id)
+        m.reactions = {k: v for k, v in m.reactions.items() if v}
+        self._refresh_bubble(m)  # optimistic-UI: счётчик уже обновился
+
+        payload = ""
+        if emoji:
+            if self.e2e_key is None:
+                # Приватность важнее фичи: без ключа чата реакция не
+                # покидает устройство; состояние откатываем к снимку.
+                m.reactions = snapshot
+                self._refresh_bubble(m)
+                self._snack("Реакции доступны только в E2E-чатах")
+                return
+            payload = encrypt_reaction_payload(self.e2e_key, emoji)
         try:
-            res = await self._api_react(target.id, emoji)
-            target.reactions = {
-                k: set(int(u) for u in v)
-                for k, v in (res.get("reactions") or {}).items()
-            }
-            self._refresh_bubble(target)
+            res = await self._api_react(m.id, payload)
         except Exception as exc:
+            # Сеть/сервер упал — откатываем optimistic-UI к прежним реакциям
+            # (локальный снимок делался до изменения) и показываем snack.
+            m.reactions = snapshot
+            self._refresh_bubble(m)
             self._snack(f"Реакция не отправлена: {exc}")
+            return
+        # Серверный summary — финальная инкарнация состояния (идемпотентно).
+        apply_reaction_summary(m, res.get("reactions") or {}, self.e2e_key)
+        self._refresh_bubble(m)
+
+    # ---------- Свайп-реакции: дедупликация жеста (Спринт 3) ----------
+
+    def _begin_swipe(self, m: Message, e) -> None:
+        """drag_start: запоминаем стартовую точку свайпа по сообщению."""
+        self._swipe_origin = getattr(e, "local_x", None)
+
+    def _end_swipe(self, m: Message, e) -> None:
+        """drag_end: если смещение достаточно велико — мгновенная 👍.
+
+        Дедупликация: не чаще одного свайп-POST на сообщение в
+        SWIPE_DEDUPE_SECONDS (защита от двойного срабатывания drag-end при
+        рывках/дроби на сенсорных экранах). Повторный свайп по сообщению,
+        где 👍 уже стоит у нас, работает как toggle (снятие).
+        """
+        origin = getattr(self, "_swipe_origin", None)
+        self._swipe_origin = None
+        end_x = getattr(e, "local_x", None)
+        if origin is None or end_x is None:
+            return
+        if abs(end_x - origin) < self.SWIPE_MIN_DELTA_PX:
+            return  # случайный микросдвиг пальца — не жест
+        if m.id is None or self.reply_target is not None:
+            return  # черновик или идёт цитирование — свайпы заняты reply-UX
+        if self.e2e_key is None:
+            return  # без ключа чата свайп-реакции приватно недоступны
+        now = time.monotonic()
+        last = self._last_swipe_at.get(m.id, 0.0)
+        if now - last < self.SWIPE_DEDUPE_SECONDS:
+            return  # анти-дребезг: слишком быстро после предыдущего свайпа
+        self._last_swipe_at[m.id] = now
+        asyncio.ensure_future(self._apply_reaction(m, QUICK_REACTIONS[0]))
 
     async def _save_edit(self, m: Message) -> Callable[[str], Awaitable[None]]:
         async def handler(new_text: str) -> None:
@@ -1043,7 +1228,7 @@ class ChatScreen:
         считаем последние VISIBLE_TAIL сообщений списка. Вызывается при
         открытии экрана и при скролле вниз (on_scroll_bottom_reached).
         """
-        tail = self.messages[-self.VISIBLE_TAIL:]
+        tail = self.messages[-self.VISIBLE_TAIL :]
         for m in tail:
             if (
                 m.id is not None
@@ -1184,6 +1369,10 @@ class ChatScreen:
         if etype in ("message_status", "STATUS_UPDATE"):
             asyncio.ensure_future(self._handle_status_update(ev))
             return
+        # Спринт 3 «Reaxions»: серверный broadcast зашифрованной реакции.
+        if etype == "reaction_update":
+            self._handle_reaction_update(ev)
+            return
         if etype != "message":
             # Фолбэк: часть событий приходит плоским payload'ом из ws_manager.
             if "status" not in ev and etype not in ("react", "edited", "reaction"):
@@ -1196,12 +1385,18 @@ class ChatScreen:
         elif kind == "react":
             m = self.index_by_id.get(int(msg_id)) if msg_id else None
             if m is not None:
-                emoji = ev.get("emoji", "")
-                user = int(ev.get("user_id", 0))
-                bucket = m.reactions.setdefault(emoji, set())
-                (bucket.discard if ev.get("removed") else bucket.add)(user)
-                if not bucket:
-                    m.reactions.pop(emoji, None)
+                summary = ev.get("reactions")
+                if isinstance(summary, dict) and summary:
+                    # Спринт 3: сервер прислал полный шифрованный summary —
+                    # единая точка применения (O(1) хеш-резолв по id).
+                    apply_reaction_summary(m, summary, self.e2e_key)
+                else:
+                    emoji = ev.get("emoji", "")
+                    user = int(ev.get("user_id", 0))
+                    bucket = m.reactions.setdefault(emoji, set())
+                    (bucket.discard if ev.get("removed") else bucket.add)(user)
+                    if not bucket:
+                        m.reactions.pop(emoji, None)
                 self._refresh_bubble(m)
         elif kind == "edited":
             m = self.index_by_id.get(int(msg_id)) if msg_id else None
@@ -1224,6 +1419,25 @@ class ChatScreen:
                 asyncio.ensure_future(self._ack_delivered(incoming))
                 if len(self.messages) <= self.VISIBLE_TAIL:
                     asyncio.ensure_future(self._send_read(incoming))
+
+    def _handle_reaction_update(self, ev: dict) -> None:
+        """Перехват WS-события reaction_update (Спринт 3).
+
+        Payload сервера: {type, chat_id, message_id, reactions:
+        {blob: [user_id,...]}} — blob'ы непрозрачны, эмодзи восстановится
+        только локальным ключом чата. Резолв сообщения — O(1) через
+        хеш-таблицу index_by_id; перерисовка одного ряда — через rows_by_id.
+        """
+        if int(ev.get("chat_id", -1)) != self.chat_id:
+            return
+        msg_id = ev.get("message_id") or ev.get("id")
+        if msg_id is None:
+            return
+        m = self.index_by_id.get(int(msg_id))
+        if m is None:
+            return  # сообщение не из этого чата / ещё не загружено
+        apply_reaction_summary(m, ev.get("reactions") or {}, self.e2e_key)
+        self._refresh_bubble(m)
 
     async def _handle_status_update(self, ev: dict) -> None:
         """Перехват STATUS_UPDATE/message_status: O(1) поиск row + перекраска.

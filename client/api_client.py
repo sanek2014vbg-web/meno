@@ -266,6 +266,35 @@ class ApiClient:
     async def mark_viewed(self, message_id: int) -> dict:
         return await self._req("POST", f"/api/messages/{message_id}/view", json={})
 
+    # ---------- Реакции (Этап 7.4, Микро-спринт 3) ----------
+    async def toggle_reaction(
+        self, message_id: int, encrypted_payload: str
+    ) -> dict:
+        """POST /messages/{id}/reactions — toggle зашифрованной реакции.
+
+        ``encrypted_payload`` — непрозрачный AES-GCM blob эмодзи (ключ чата):
+        сервер хранит и ретранслирует его как есть и не видит сам эмодзи.
+        Ответ сервера: {ok, active, message_id, reactions} — summary вида
+        {payload: [user_id, ...]}.
+        """
+        return await self._req(
+            "POST",
+            f"/api/messages/{message_id}/reactions",
+            json={"payload": encrypted_payload},
+        )
+
+    async def chat_reactions(self, chat_id: int, ids: list[int]) -> dict:
+        """Batch-load реакций страницы истории одним запросом (анти-N+1).
+
+        Возвращает {reactions: {"<message_id>": {payload: [user_id, ...]}}}.
+        """
+        data = await self._req(
+            "GET",
+            f"/api/chats/{chat_id}/messages/reactions",
+            params={"ids": ",".join(str(i) for i in ids)},
+        )
+        return data.get("reactions") or {}
+
     async def update_message_status(
         self, message_id: int, status: str, ghost: bool = False
     ) -> dict:

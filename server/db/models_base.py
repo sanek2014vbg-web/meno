@@ -16,6 +16,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
     text,
 )
 from sqlalchemy.ext.asyncio import AsyncAttrs
@@ -152,6 +153,20 @@ class Message(Base):
     status = Column(MESSAGE_STATUS_ENUM, nullable=False, server_default="sent")
     delivered_at = Column(DateTime(timezone=True))
     read_at = Column(DateTime(timezone=True))
+    # --- Этап 7.4: Ответы (Replies/Quotes) и Реакции (Микро-спринт 3) ---
+    # reply_to_id — открытый id сообщения-оригинала в том же чате. Сам id
+    # метаданных не несёт (контент остаётся AES-GCM blob'ом), поэтому он не
+    # нарушает E2EE; каскад SET NULL: удаление оригинала НЕ должно стирать
+    # ответы на него (иначе DELETE-гонка превратилась бы в лавину потерь).
+    reply_to_id = Column(
+        Integer, ForeignKey("messages.id", ondelete="SET NULL"), nullable=True
+    )
+    # Денормализованный кэш реакций {"👍": ["alice_hash", ...]} (JSON-текст).
+    # Нужен, чтобы список чатов/поиск отдавал счётчики реакций БЕД JOIN'а с
+    # reactions; сам трек реакций при загрузке истории берётся batch-load'ом
+    # одним запросом IN (:ids) — см. routes_reactions.fetch_summaries_batch.
+    # '{}' вместо NULL: пустое значение всегда валидно для json.loads.
+    reactions_summary = Column(Text, nullable=False, server_default="{}")
 
     __table_args__ = (
         Index("idx_messages_chat_id_id_desc", "chat_id", "id"),
@@ -162,6 +177,46 @@ class Message(Base):
         Index("idx_messages_chat_status", "chat_id", "status"),
         # Идемпотентность отправки: один client_id не может повториться в чате
         Index("uq_messages_chat_client", "chat_id", "client_id", unique=True),
+        # Ответы: быстрый поиск «нитей» вокруг оригинала + проверка
+        # принадлежности reply_to_id тому же чату при отправке
+        Index("idx_messages_reply_to", "reply_to_id"),
+    )
+
+
+class Reaction(Base):
+    """Реакция (эмодзи) на сообщение — ЭТАП 7.4 / Микро-спринт 3.
+
+    Privacy-модель:
+    - user_id хранится ОТКРЫТО — это necessary metadata для toggle-логики
+      (уникальность на пару message+user) и права удаления; сам факт
+      «кто отреагировал» виден только участникам чата через API.
+    - encrypted_payload — непрозрачный AES-GCM blob `{nonce}:{ct}:{tag}`
+      (base64url), который клиент собирает из симметричного ключа чата.
+      Сервер НЕ знает эмодзи — он умеет только пересылать blob участникам
+      по WebSocket. Это защита от метатак на граф социальных связей.
+    """
+
+    __tablename__ = "reactions"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    message_id = Column(
+        Integer, ForeignKey("messages.id", ondelete="CASCADE"), nullable=False
+    )
+    user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    encrypted_payload = Column(Text, nullable=False)
+    created_at = Column(
+        DateTime(timezone=True), nullable=False,
+        server_default=text("(CURRENT_TIMESTAMP)"),
+    )
+
+    __table_args__ = (
+        # Toggle-инвариант: один пользователь — не больше одной реакции
+        # на сообщение. Служит и «замком» для гонки двойного POST:
+        # проигравший транзакции ловит IntegrityError -> 409.
+        UniqueConstraint("message_id", "user_id", name="uq_reactions_message_user"),
+        # Обратный путь: «все реакции пользователя» (чистка при удалении аккаунта)
+        Index("idx_reactions_user", "user_id"),
     )
 
 

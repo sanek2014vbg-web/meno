@@ -25,6 +25,7 @@ from server.db.models_base import (
     Message,
     PushOutbox,
     PushToken,
+    Reaction,  # noqa: F401 (реэкспорт модели для тестов/сервисов через фасад)
     RefreshToken,
     Report,
     SecurityEvent,

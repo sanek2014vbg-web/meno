@@ -49,6 +49,69 @@ def _fmt_time(dt: datetime) -> str:
 
 
 # ---------------------------------------------------------------------------
+# E2EE-реакции (Этап 7.4): клиент шифрует эмодзи ключом чата (AES-GCM),
+# сервер хранит и ретранслирует только непрозрачный blob.
+# ---------------------------------------------------------------------------
+
+#: Короткий префикс — отличает наш формат blob'а от мусора/легаси-строк.
+REACTION_BLOB_PREFIX = "rx1:"
+
+
+def encrypt_reaction_payload(chat_key: bytes, emoji: str) -> str:
+    """Эмодзи -> AES-GCM blob (base64url) для POST /messages/{id}/reactions."""
+    import base64
+
+    import crypto
+
+    sealed = crypto.encrypt_text(chat_key, emoji)
+    b64url = base64.urlsafe_b64encode(sealed.encode()).decode().rstrip("=")
+    return f"{REACTION_BLOB_PREFIX}{b64url}"
+
+
+def decrypt_reaction_blob(chat_key: Optional[bytes], blob: str) -> Optional[str]:
+    """Blob -> эмодзи; None при отсутствии ключа или битом содержимом.
+
+    Дешифровка локальна и best-effort: чужой/повреждённый blob никогда не
+    должен уронить UI (сообщение отрисуется без этой реакции).
+    """
+    if chat_key is None or not blob or not blob.startswith(REACTION_BLOB_PREFIX):
+        return None
+    try:
+        import base64
+
+        import crypto
+
+        body = blob[len(REACTION_BLOB_PREFIX):]
+        padded = body + "=" * (-len(body) % 4)
+        sealed = base64.urlsafe_b64decode(padded.encode()).decode()
+        return crypto.decrypt_text(chat_key, sealed)
+    except Exception:
+        return None
+
+
+def apply_reaction_summary(
+    message: "Message",
+    summary: dict,
+    chat_key: Optional[bytes],
+) -> bool:
+    """Серверный summary {blob: [user_id,...]} -> локальные реакции сообщения.
+
+    Возвращает True, если набор реакций реально изменился (нужна
+    перерисовка ряда). Это единственная точка, где зашифрованные реакции
+    превращаются в человекочитаемые эмодзи на клиенте.
+    """
+    rebuilt: dict[str, set[int]] = {}
+    for blob, users in (summary or {}).items():
+        emoji = decrypt_reaction_blob(chat_key, str(blob))
+        if emoji is None:
+            continue  # нет ключа / мусор — молча деградируем
+        rebuilt.setdefault(emoji, set()).update(int(u) for u in users)
+    changed = rebuilt != message.reactions
+    message.reactions = rebuilt
+    return changed
+
+
+# ---------------------------------------------------------------------------
 # Модель данных
 # ---------------------------------------------------------------------------
 
