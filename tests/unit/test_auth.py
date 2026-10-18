@@ -1,4 +1,5 @@
 """Юнит-тесты криптографического ядра аутентификации (без БД)."""
+
 from datetime import datetime, timedelta, timezone
 
 import pyotp
@@ -51,7 +52,6 @@ def test_invalid_jwt_token():
 
 def test_jwt_rejects_wrong_secret():
     import jwt as pyjwt
-    from server import config
 
     forged = pyjwt.encode({"sub": "1", "type": "access"}, "x" * 64, algorithm="HS256")
     assert decode_token(forged) is None
@@ -62,8 +62,13 @@ def test_jwt_rejects_refresh_type():
     from server import config
 
     tok = pyjwt.encode(
-        {"sub": "1", "type": "refresh", "exp": datetime.now(timezone.utc) + timedelta(hours=1)},
-        config.JWT_SECRET, algorithm=config.JWT_ALGO,
+        {
+            "sub": "1",
+            "type": "refresh",
+            "exp": datetime.now(timezone.utc) + timedelta(hours=1),
+        },
+        config.JWT_SECRET,
+        algorithm=config.JWT_ALGO,
     )
     assert decode_token(tok) is None
 
@@ -81,7 +86,9 @@ def test_totp_verification():
     secret = generate_totp_secret()
     totp = pyotp.TOTP(secret)
     assert verify_totp(secret, totp.now()) is True
-    assert verify_totp(secret, "000000") is False or True  # код может случайно совпасть — проверяем ниже надёжнее
+    assert (
+        verify_totp(secret, "000000") is False or True
+    )  # код может случайно совпасть — проверяем ниже надёжнее
     assert verify_totp(secret, "999999") is False or totp.now() == "999999"
 
 
@@ -106,7 +113,9 @@ def test_account_lockout_logic():
 
 def test_account_lockout_naive_db_datetime_is_handled():
     """A17: naive datetime из БД приводится к UTC и корректно сравнивается."""
-    naive_future = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=5)
+    naive_future = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(
+        minutes=5
+    )
     locked, _ = is_account_locked({"lockout_until": naive_future})
     assert locked is True
 

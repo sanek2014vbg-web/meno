@@ -3,6 +3,7 @@
 Полностью изолированы от сети: boto3-клиент подменяется MagicMock'ом,
 ни одного реального HTTP-запроса к S3/MinIO не выполняется.
 """
+
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -27,8 +28,10 @@ class TestS3ManagerIsolation:
         assert s3_manager.client() is fake_s3
 
     def test_enabled_and_bucket_follow_config(self):
-        with patch.object(config, "S3_ENABLED", True), \
-             patch.object(config, "S3_BUCKET", "my-bucket"):
+        with (
+            patch.object(config, "S3_ENABLED", True),
+            patch.object(config, "S3_BUCKET", "my-bucket"),
+        ):
             m = S3Manager()
             assert m.enabled is True
             assert m.bucket == "my-bucket"
@@ -45,9 +48,11 @@ class TestUpload:
         size = await S3Manager().upload_fileobj(file_obj, "u/1/photo.png")
         assert size == 4096
         fake_s3.upload_fileobj.assert_called_once_with(
-            file_obj, config.S3_BUCKET, "u/1/photo.png")
+            file_obj, config.S3_BUCKET, "u/1/photo.png"
+        )
         fake_s3.head_object.assert_called_once_with(
-            Bucket=config.S3_BUCKET, Key="u/1/photo.png")
+            Bucket=config.S3_BUCKET, Key="u/1/photo.png"
+        )
 
     async def test_upload_without_profile_raises(self):
         with patch("server.s3_manager._get_s3", return_value=None):
@@ -62,8 +67,7 @@ class TestPresignedUrl:
         assert url == "https://s3/signed?X"
         args, kwargs = fake_s3.generate_presigned_url.call_args
         assert args[0] == "get_object"
-        assert kwargs["Params"] == {"Bucket": config.S3_BUCKET,
-                                    "Key": "u/1/file.pdf"}
+        assert kwargs["Params"] == {"Bucket": config.S3_BUCKET, "Key": "u/1/file.pdf"}
         assert kwargs["ExpiresIn"] == 60
 
     def test_default_expiry_one_hour(self, fake_s3):

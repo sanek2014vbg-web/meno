@@ -5,6 +5,7 @@
 - ядро работает без внешних платных сервисов (S3/FCM/Sentry опциональны);
 - вся конфигурация читается один раз при импорте и валидируется.
 """
+
 import os
 import secrets
 
@@ -50,6 +51,10 @@ def _normalize_db_url(url: str) -> str:
 # DEV_ENV=1 разрешает запуск с временным dev-секретом JWT (только локальная разработка).
 DEV_ENV = _env_bool("MENO_DEV_ENV", False)
 
+# --- Явный флаг окружения (дефолт выводится из режима, а не наоборот) ---
+ENVIRONMENT = _env("MENO_ENVIRONMENT") or ("development" if DEV_ENV else "production")
+IS_PRODUCTION = ENVIRONMENT != "development"
+
 # --- bcrypt cost factor ---
 # В проде — стандартные 12 раундов. В тестах MENO_BCRYPT_ROUNDS=4 ускоряет
 # хеширование в ~256 раз (иначе 16 интеграционных тестов с регистрациями
@@ -61,7 +66,9 @@ BCRYPT_ROUNDS = min(max(_env_int("MENO_BCRYPT_ROUNDS", 12), 4), 15)
 # --- Database ---
 # PostgreSQL: postgresql+asyncpg://user:pass@host:port/dbname
 # Локально без сервера можно использовать SQLite: sqlite+aiosqlite:///./meno.db
-DATABASE_URL = _normalize_db_url(_env("MENO_DATABASE_URL", "sqlite+aiosqlite:///./meno.db"))
+DATABASE_URL = _normalize_db_url(
+    _env("MENO_DATABASE_URL", "sqlite+aiosqlite:///./meno.db")
+)
 IS_SQLITE = DATABASE_URL.startswith("sqlite")
 
 # --- Redis ---
@@ -73,19 +80,27 @@ REDIS_URL = _env("MENO_REDIS_URL", "")
 SENTRY_DSN = _env("MENO_SENTRY_DSN", "")
 
 # --- JWT ---
+# Любое значение из этого набора запрещает старт прод-сервера (Fail-Fast).
+# Включая секрет, который когда-то был закоммичен в .env репозитория:
+# он считается скомпрометированным навсегда, ротация — обязательна.
 _KNOWN_INSECURE_SECRETS = {
     "meno-dev-secret-change-me",
     "meno-dev-secret",
     "change-me",
     "secret",
     "your_random_long_string_here",
+    "2RdNAEy8rYTVIK_MnUIGtj60AkiGRqmRZwfawbpPzPrlkhrkApb_Wf2UFPwNB6uD",
 }
 
 
 def _resolve_jwt_secret() -> tuple[str, bool]:
     """Возвращает (secret, is_ephemeral_dev).
 
-    P0-требование: продакшен не стартует с дефолтным/известным секретом.
+    Fail-Fast (P0): в продакшене сервер намертво отказывается стартовать
+    с отсутствующим, задокументированным по умолчанию, коротким или
+    «закоммиченным когда-то» секретом. Список известных небезопасных
+    значений расширен значением из старого .env.example — именно оно
+    годами утекало в прод при деплое «как в примере».
     """
     raw = os.environ.get("MENO_JWT_SECRET", "").strip()
     if raw and raw not in _KNOWN_INSECURE_SECRETS:
@@ -109,6 +124,19 @@ def _resolve_jwt_secret() -> tuple[str, bool]:
 
 
 JWT_SECRET, JWT_SECRET_IS_EPHEMERAL = _resolve_jwt_secret()
+
+# --- Fail-Fast при перекосе окружения (P0 Security) ---
+# Ephemeral dev-секрет допустим ТОЛЬКО в development. Если кто-то выставил
+# MENO_ENVIRONMENT=production, забыв снять MENO_DEV_ENV (или наоборот),
+# сервер обязан упасть на старте с внятной ошибкой, а не молча подписывать
+# токены одноразовым ключом, который отличается после каждого рестарта.
+if JWT_SECRET_IS_EPHEMERAL and IS_PRODUCTION:
+    raise RuntimeError(
+        "Конфликт конфигурации: MENO_DEV_ENV=1 (эфемерный JWT-секрет) вместе с "
+        "MENO_ENVIRONMENT=production запрещён. В проде задайте постоянный "
+        "MENO_JWT_SECRET (>=32 символов) и уберите MENO_DEV_ENV."
+    )
+
 JWT_ALGO = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = _env_int("MENO_ACCESS_TOKEN_EXPIRE_MINUTES", 15)
 REFRESH_TOKEN_EXPIRE_DAYS = _env_int("MENO_REFRESH_TOKEN_EXPIRE_DAYS", 7)
@@ -133,18 +161,24 @@ S3_REGION = _env("MENO_S3_REGION", "us-east-1")
 S3_USE_SSL = _env_bool("MENO_S3_USE_SSL", True)
 
 # --- Антиспам ---
-SPAM_MSG_PER_MINUTE = _env_int("MENO_SPAM_MSG_PER_MINUTE", 20)  # сообщений в минуту на пользователя
+SPAM_MSG_PER_MINUTE = _env_int(
+    "MENO_SPAM_MSG_PER_MINUTE", 20
+)  # сообщений в минуту на пользователя
 
 # --- Защита от брутфорса (rate limiting) ---
-RL_LOGIN_LIMIT = _env_int("MENO_RL_LOGIN_LIMIT", 30)      # попыток входа
-RL_LOGIN_WINDOW = _env_int("MENO_RL_LOGIN_WINDOW", 900)   # за 15 минут на связку IP+username
+RL_LOGIN_LIMIT = _env_int("MENO_RL_LOGIN_LIMIT", 30)  # попыток входа
+RL_LOGIN_WINDOW = _env_int(
+    "MENO_RL_LOGIN_WINDOW", 900
+)  # за 15 минут на связку IP+username
 RL_REGISTER_LIMIT = _env_int("MENO_RL_REGISTER_LIMIT", 10)
 RL_REGISTER_WINDOW = _env_int("MENO_RL_REGISTER_WINDOW", 3600)
 RL_UPLOAD_LIMIT = _env_int("MENO_RL_UPLOAD_LIMIT", 60)
 RL_UPLOAD_WINDOW = _env_int("MENO_RL_UPLOAD_WINDOW", 300)
-RL_GLOBAL_LIMIT = _env_int("MENO_RL_GLOBAL_LIMIT", 900)   # любых запросов к API...
+RL_GLOBAL_LIMIT = _env_int("MENO_RL_GLOBAL_LIMIT", 900)  # любых запросов к API...
 RL_GLOBAL_WINDOW = _env_int("MENO_RL_GLOBAL_WINDOW", 60)  # ...в минуту на IP
-RL_TRUST_PROXY = _env_bool("MENO_RL_TRUST_PROXY", True)   # учитывать X-Forwarded-For (за nginx)
+RL_TRUST_PROXY = _env_bool(
+    "MENO_RL_TRUST_PROXY", True
+)  # учитывать X-Forwarded-For (за nginx)
 
 # --- Логирование ---
 # access-лог uvicorn отключаем: в query-параметрах может оказаться токен.
@@ -157,7 +191,9 @@ HSTS_ENABLED = _env_bool("MENO_HSTS_ENABLED", False)
 # --- CORS ---
 # По умолчанию — пусто (без внешних origins). Для веб-клиента перечислите
 # точные origins через запятую: https://chat.example.com,http://localhost:8550
-CORS_ORIGINS = [o.strip() for o in _env("MENO_CORS_ORIGINS", "").split(",") if o.strip()]
+CORS_ORIGINS = [
+    o.strip() for o in _env("MENO_CORS_ORIGINS", "").split(",") if o.strip()
+]
 
 # --- Push-уведомления (FCM, полностью опциональны) ---
 FCM_SERVER_KEY = _env("MENO_FCM_SERVER_KEY")

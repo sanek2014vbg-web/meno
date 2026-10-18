@@ -127,7 +127,7 @@ jobs:
 
       - name: Run pytest with coverage gate
         run: >
-          pytest server/tests tests
+          pytest tests/unit tests/integration
           --cov=server --cov-report=term-missing --cov-report=xml
           --cov-fail-under=70
           -q --maxfail=10

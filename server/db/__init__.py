@@ -10,6 +10,7 @@
 код (`from server import database`, миграции Alembic, тесты) продолжает работать
 без правок. Новый код должен импортировать атомарные модули напрямую.
 """
+
 from server.db.connection import AsyncSessionLocal, close_pool, engine
 from server.db.models_base import (
     Base,

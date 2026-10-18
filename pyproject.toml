@@ -2,7 +2,9 @@
 # Pytest-настройки живут в pytest.ini, линтер — в ruff.toml (не меняем поведение CI).
 
 [tool.mypy]
-python_version = "3.12"
+# Единый стандарт окружения v1.0.0: Python 3.11 (Dockerfile, CI-matrix,
+# poetry requires-python). Рассинхрон mypy/CI был P0-дефектом аудита.
+python_version = "3.11"
 files = ["server", "client"]
 # Плоская структура клиента (sys.path = client/): фиксируем базовый путь,
 # чтобы модули не находились дважды под разными именами.

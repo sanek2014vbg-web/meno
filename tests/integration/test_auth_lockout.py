@@ -15,13 +15,15 @@ async def test_login_lockout(client, auth_factory):
     # 1. Неверные входы до лимита — каждый даёт честный 400
     for i in range(MAX_FAILED_ATTEMPTS):
         resp = await client.post(
-            "/api/login", json={"username": user["username"], "password": "wrong_password"}
+            "/api/login",
+            json={"username": user["username"], "password": "wrong_password"},
         )
         assert resp.status_code == 400, f"attempt {i + 1}: {resp.text}"
 
     # 2. Следующая попытка заблокирована (403), даже верным паролем
     resp = await client.post(
-        "/api/login", json={"username": user["username"], "password": "Correct-Horse-1!"}
+        "/api/login",
+        json={"username": user["username"], "password": "Correct-Horse-1!"},
     )
     assert resp.status_code == 403, resp.text
     assert "заблокирован" in resp.text

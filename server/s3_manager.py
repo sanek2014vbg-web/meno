@@ -6,6 +6,7 @@
 Раньше модуль был мёртвым кодом с битым импортом ``import config``
 таинь-модуля и синглтоном, падающим при старте без S3 — исправлено (Фаза 3).
 """
+
 from __future__ import annotations
 
 from typing import Optional

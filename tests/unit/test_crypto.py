@@ -8,6 +8,7 @@
 (MENO_DATA_DIR читается crypto._data_dir() при импорте модуля, поэтому для
 каждого теста криптография перезагружается с новым каталогом данных).
 """
+
 import importlib
 import json
 from pathlib import Path
@@ -27,6 +28,7 @@ def c(tmp_path, monkeypatch):
 
 # ---------- Генерация ключей ----------
 
+
 class TestGenerateKeys:
     def test_returns_b64_pair_with_correct_lengths(self, c):
         priv_b64, pub_b64 = c.generate_keys()
@@ -43,16 +45,13 @@ class TestGenerateKeys:
         from cryptography.hazmat.primitives.asymmetric import x25519
 
         priv_b64, pub_b64 = c.generate_keys()
-        priv = x25519.X25519PrivateKey.from_private_bytes(
-            c.base64.b64decode(priv_b64)
-        )
-        derived_pub = c.base64.b64encode(
-            priv.public_key().public_bytes_raw()
-        ).decode()
+        priv = x25519.X25519PrivateKey.from_private_bytes(c.base64.b64decode(priv_b64))
+        derived_pub = c.base64.b64encode(priv.public_key().public_bytes_raw()).decode()
         assert derived_pub == pub_b64
 
 
 # ---------- Согласование общего секрета (X25519 + HKDF) ----------
+
 
 class TestSharedSecret:
     def test_both_sides_derive_same_key(self, c):
@@ -67,8 +66,9 @@ class TestSharedSecret:
         priv_a, _ = c.generate_keys()
         _, pub_b = c.generate_keys()
         _, pub_c = c.generate_keys()
-        assert c.derive_shared_secret(priv_a, pub_b) != \
-               c.derive_shared_secret(priv_a, pub_c)
+        assert c.derive_shared_secret(priv_a, pub_b) != c.derive_shared_secret(
+            priv_a, pub_c
+        )
 
     def test_derive_chat_key_is_alias_of_derive_shared_secret(self, c):
         assert c.derive_chat_key is c.derive_shared_secret
@@ -80,6 +80,7 @@ class TestSharedSecret:
 
 
 # ---------- AES-GCM: раундтрек и отказы ----------
+
 
 class TestEncryptDecryptBytes:
     def test_roundtrip(self, c):
@@ -117,11 +118,11 @@ class TestEncryptDecryptBytes:
         key = c.secrets.token_bytes(32)
         raw = bytearray(c.base64.b64decode(c.encrypt_bytes(key, b"hello world")))
         if mutate == "flip_byte":
-            raw[-1] ^= 0x01                      # подделан тег GCM
+            raw[-1] ^= 0x01  # подделан тег GCM
         elif mutate == "truncate":
-            del raw[-5:]                          # обрезан тег
+            del raw[-5:]  # обрезан тег
         else:
-            raw = raw[:8]                         # меньше длины nonce
+            raw = raw[:8]  # меньше длины nonce
         bad = c.base64.b64encode(bytes(raw)).decode()
         with pytest.raises((InvalidTag, ValueError)):
             c.decrypt_bytes(key, bad)
@@ -134,8 +135,9 @@ class TestEncryptDecryptBytes:
 
 class TestTextApi:
     def test_unicode_roundtrip(self, c):
-        key = c.derive_shared_secret(*[t for t in c.generate_keys()][:1] +
-                                     [c.generate_keys()[1]])
+        key = c.derive_shared_secret(
+            *[t for t in c.generate_keys()][:1] + [c.generate_keys()[1]]
+        )
         text = "Привет, мир! 🌍 <b>&amp;</b>"
         payload = c.encrypt_text(key, text)
         assert c.decrypt_text(key, payload) == text
@@ -150,6 +152,7 @@ class TestTextApi:
 
 
 # ---------- Мастер-ключ PBKDF2 и хранение приватного ключа ----------
+
 
 class TestMasterKeyAndKeystore:
     def test_master_key_deterministic_and_password_sensitive(self, c):
@@ -177,9 +180,10 @@ class TestMasterKeyAndKeystore:
     def test_decrypt_private_key_wrong_password_returns_none(self, c):
         c.ensure_keys("correct horse battery staple")
         data = json.loads(Path(c.DATA_FILE).read_text(encoding="utf-8"))["e2e"]
-        assert c.decrypt_private_key(
-            "wrong-password", data["salt"], data["priv_enc"]
-        ) is None
+        assert (
+            c.decrypt_private_key("wrong-password", data["salt"], data["priv_enc"])
+            is None
+        )
 
     def test_decrypt_private_key_garbage_inputs_return_none(self, c):
         assert c.decrypt_private_key("p", "%%%", "%%%") is None
@@ -199,6 +203,7 @@ def _stored_args(c):
 
 
 # ---------- Vault и ПИН-хранилище (работают без сети) ----------
+
 
 class TestVaultAndPins:
     def test_token_lifecycle(self, c, monkeypatch):
@@ -223,9 +228,9 @@ class TestVaultAndPins:
         monkeypatch.setattr(c, "_get_machine_id", lambda: b"stable-id")
         c.vault_save_token("alice", "tok")
         key_before = c._device_key()
-        mod2 = importlib.reload(c)                     # новый экземпляр модуля
+        mod2 = importlib.reload(c)  # новый экземпляр модуля
         monkeypatch.setattr(mod2, "_get_machine_id", lambda: b"stable-id")
-        assert mod2._device_key() == key_before        # ключ детерминирован
+        assert mod2._device_key() == key_before  # ключ детерминирован
         assert mod2.vault_load_token("alice") == "tok"
 
     def test_vault_load_returns_empty_on_foreign_device(self, c, monkeypatch):

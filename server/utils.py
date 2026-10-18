@@ -1,4 +1,5 @@
 """MeNo — общие утилиты (время, сериализация)."""
+
 from datetime import datetime, timezone
 
 

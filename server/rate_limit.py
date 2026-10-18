@@ -13,6 +13,7 @@ user_id для авторизованных действий). Связка с I
 Выбор режима происходит асинхронно (limiter.allow_async); синхронный allow()
 оставлен для фолбэка и тестов.
 """
+
 import threading
 import time
 from collections import defaultdict, deque
@@ -59,15 +60,22 @@ class RateLimiter:
                 if self._script_sha is None:
                     self._script_sha = await redis.script_load(_LUA_ALLOW)
                 ok = await redis.evalsha(
-                    self._script_sha, 1, f"rl:{key}",
-                    str(time.time()), str(int(window * 1000)), str(limit),
+                    self._script_sha,
+                    1,
+                    f"rl:{key}",
+                    str(time.time()),
+                    str(int(window * 1000)),
+                    str(limit),
                     f"{time.monotonic_ns()}",
                 )
                 return bool(ok)
             except Exception as exc:  # noqa: BLE001 — деградация до локального окна
                 from loguru import logger
 
-                logger.warning("Redis rate limiter unavailable ({}), local fallback", exc.__class__.__name__)
+                logger.warning(
+                    "Redis rate limiter unavailable ({}), local fallback",
+                    exc.__class__.__name__,
+                )
                 self._script_sha = None
         return self.allow(key, limit, window)
 

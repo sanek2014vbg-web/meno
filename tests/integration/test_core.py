@@ -14,8 +14,11 @@
 Стиль импортов — пакетный `server.*` (чинит A1). Все тесты async
 (pytest-asyncio, asyncio_mode=auto в pytest.ini).
 """
+
 import asyncio
 import json
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from uuid import uuid4
 
 import pytest
@@ -35,6 +38,7 @@ from server.ws_manager import WS_CHANNEL, manager
 # Утилита: прямой доступ к БД вне HTTP (для проверки IntegrityError-семантики)
 # ---------------------------------------------------------------------------
 
+
 async def _insert_user(username: str, pw_hash: str = "x", role: str = "user") -> None:
     async with database.get_db() as db:
         await db.execute(
@@ -49,6 +53,7 @@ async def _insert_user(username: str, pw_hash: str = "x", role: str = "user") ->
 # ---------------------------------------------------------------------------
 # 1. Атомарная регистрация (Этап 2.2, дефект A10)
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.asyncio
 async def test_register_success(client, auth_factory):
@@ -74,10 +79,15 @@ async def test_register_duplicate_username_rejected(client, auth_factory):
         json={"username": "bob", "password": "Secret-123!", "display_name": "Bob 2"},
     )
     assert resp.status_code == 400
-    assert "занято" in resp.json()["detail"].lower() or "уже" in resp.json()["detail"].lower()
+    assert (
+        "занято" in resp.json()["detail"].lower()
+        or "уже" in resp.json()["detail"].lower()
+    )
 
     async with database.get_db() as db:
-        rows = await database.aq(db, "SELECT id FROM users WHERE username=:u", {"u": "bob"})
+        rows = await database.aq(
+            db, "SELECT id FROM users WHERE username=:u", {"u": "bob"}
+        )
     assert len(rows) == 1, "UNIQUE(username) обязан не допустить второй записи"
 
 
@@ -90,7 +100,9 @@ async def test_register_race_integrity_error(client, auth_factory):
         await _insert_user("carol")
 
     async with database.get_db() as db:
-        rows = await database.aq(db, "SELECT id FROM users WHERE username=:u", {"u": "carol"})
+        rows = await database.aq(
+            db, "SELECT id FROM users WHERE username=:u", {"u": "carol"}
+        )
     assert len(rows) == 1
 
 
@@ -98,13 +110,17 @@ async def test_register_race_integrity_error(client, auth_factory):
 async def test_concurrent_registrations_only_one_wins(client):
     """N параллельных register с одним username: ровно один 200, остальные 400."""
     payload = {"username": "dave", "password": "Secret-123!", "display_name": "Dave"}
-    responses = await asyncio.gather(*(client.post("/api/register", json=payload) for _ in range(6)))
+    responses = await asyncio.gather(
+        *(client.post("/api/register", json=payload) for _ in range(6))
+    )
     codes = [r.status_code for r in responses]
     assert codes.count(200) == 1, f"атомарность нарушена: {codes}"
     assert set(codes) <= {200, 400}
 
     async with database.get_db() as db:
-        rows = await database.aq(db, "SELECT id FROM users WHERE username=:u", {"u": "dave"})
+        rows = await database.aq(
+            db, "SELECT id FROM users WHERE username=:u", {"u": "dave"}
+        )
     assert len(rows) == 1
 
 
@@ -116,19 +132,24 @@ async def test_register_validation_and_audit_log(client):
     )
     assert resp.status_code == 422
 
-    await client.post("/api/register", json={"username": "erin", "password": "Secret-123!"})
+    await client.post(
+        "/api/register", json={"username": "erin", "password": "Secret-123!"}
+    )
     async with database.get_db() as db:
         ev = await database.aq(
             db,
             "SELECT event_type FROM security_events WHERE username=:u ORDER BY id",
             {"u": "erin"},
         )
-    assert any(r["event_type"] == "register" for r in ev), "audit-лог регистрации отсутствует (Этап 2.3)"
+    assert any(r["event_type"] == "register" for r in ev), (
+        "audit-лог регистрации отсутствует (Этап 2.3)"
+    )
 
 
 # ---------------------------------------------------------------------------
 # 2. Ротация refresh-токенов и детекция кражи (Этап 2.4)
 # ---------------------------------------------------------------------------
+
 
 async def _rotate(client, refresh_token: str):
     return await client.post("/api/refresh", json={"refresh_token": refresh_token})
@@ -157,13 +178,13 @@ async def test_refresh_reuse_detects_theft_and_revokes_family(client, auth_facto
     повторно использует старый refresh → вся семья сессий отзывается,
     последующие ротации падают с 401."""
     bob = await auth_factory("bob")
-    stolen_rt = bob["refresh_token"]           # токен, перехваченный «злоумышленником»
+    stolen_rt = bob["refresh_token"]  # токен, перехваченный «злоумышленником»
 
-    legit = await _rotate(client, stolen_rt)   # легитимная ротация: stolen_rt гаснет
+    legit = await _rotate(client, stolen_rt)  # легитимная ротация: stolen_rt гаснет
     assert legit.status_code == 200
     rotated_rt = legit.json()["refresh_token"]
 
-    reuse = await _rotate(client, stolen_rt)   # переиспользование украденного токена
+    reuse = await _rotate(client, stolen_rt)  # переиспользование украденного токена
     assert reuse.status_code == 401, "переиспользованный refresh обязан быть отклонён"
 
     # детекция кражи отзывает ВСЮ семью: даже только что выданный токен мёртв
@@ -204,6 +225,7 @@ async def test_invalid_refresh_token_rejected(client):
 # ---------------------------------------------------------------------------
 # 3. Поиск по кириллице + курсорная пагинация (Этапы 4.2, 4.4; дефект A12)
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.asyncio
 async def test_search_cyrillic_with_cursor_pagination(client, user_alice, chat):
@@ -294,7 +316,9 @@ async def test_history_cursor_pagination(client, user_alice, chat):
         headers=user_alice["headers"],
     )
     b2 = second.json()
-    assert not seen & {m["id"] for m in b2["messages"]}, "курсорная пагинация не должна повторять записи"
+    assert not seen & {m["id"] for m in b2["messages"]}, (
+        "курсорная пагинация не должна повторять записи"
+    )
 
 
 @pytest.mark.asyncio
@@ -302,14 +326,19 @@ async def test_send_message_idempotency_by_client_id(client, user_alice, chat):
     """Повторная отправка с тем же client_id возвращает то же сообщение (Этап 4.5)."""
     cid = f"cid-{uuid4().hex}"
     body = {"type": "text", "content": "идемпотентный текст", "client_id": cid}
-    r1 = await client.post(f"/api/chats/{chat['id']}/messages", json=body, headers=user_alice["headers"])
-    r2 = await client.post(f"/api/chats/{chat['id']}/messages", json=body, headers=user_alice["headers"])
+    r1 = await client.post(
+        f"/api/chats/{chat['id']}/messages", json=body, headers=user_alice["headers"]
+    )
+    r2 = await client.post(
+        f"/api/chats/{chat['id']}/messages", json=body, headers=user_alice["headers"]
+    )
     assert r1.status_code == 200 and r2.status_code == 200
     assert r1.json()["id"] == r2.json()["id"]
 
     async with database.get_db() as db:
         rows = await database.aq(
-            db, "SELECT id FROM messages WHERE chat_id=:c AND client_id=:i",
+            db,
+            "SELECT id FROM messages WHERE chat_id=:c AND client_id=:i",
             {"c": chat["id"], "i": cid},
         )
     assert len(rows) == 1
@@ -318,6 +347,27 @@ async def test_send_message_idempotency_by_client_id(client, user_alice, chat):
 # ---------------------------------------------------------------------------
 # 4. WebSocket Pub/Sub поверх Redis — эмуляция нескольких воркеров (A11, 5.1)
 # ---------------------------------------------------------------------------
+
+
+def _recv_with_timeout(ws, timeout: float = 5.0) -> dict:
+    """Блокирующий receive_json() TestClient в worker-потоке + внешний таймаут.
+
+    Дефект-фикс v1.0.0: ws.receive_json() внутри anyio blocking portal
+    не имеет собственного дедлайна — при потере события тест вешал весь
+    пайплайн (150+ c без выхода). Поток-обёртка гарантирует: нет события
+    за `timeout` секунд -> TimeoutError, а не зависание. Поток-«сирота»
+    после таймаута безвреден: сокет закрывается контекстным менеджером
+    теста, и блокировка снимается исключением закрытия.
+    """
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        fut = pool.submit(ws.receive_json)
+        try:
+            return fut.result(timeout=timeout)
+        except FuturesTimeoutError:
+            raise TimeoutError(
+                f"WS-событие не получено за {timeout} c (зависание снято по дизайну)"
+            ) from None
+
 
 class FakeWorkerSocket:
     """Минимальная заглушка Starlette WebSocket для in-process теста менеджера:
@@ -349,7 +399,9 @@ class FakeWorkerSocket:
 
 
 @pytest.mark.asyncio
-async def test_ws_pubsub_fanout_across_workers(client, user_alice, user_bob, chat, fake_redis):
+async def test_ws_pubsub_fanout_across_workers(
+    client, user_alice, user_bob, chat, fake_redis
+):
     """Два «воркера» подписаны на канал meno:ws; отправка сообщения через HTTP
     публикует событие в шину, и оба WS-клиента получают new_message."""
     assert fake_redis is not None, "fakeredis недоступен — шина не смоделирована"
@@ -385,7 +437,9 @@ async def test_ws_pubsub_fanout_across_workers(client, user_alice, user_bob, cha
 
 
 @pytest.mark.asyncio
-async def test_ws_manager_inprocess_delivery_without_redis(client, user_alice, monkeypatch):
+async def test_ws_manager_inprocess_delivery_without_redis(
+    client, user_alice, monkeypatch
+):
     """In-process режим (без Redis) доставляет сообщение локально — фолбэк для
     single-worker self-hosted инсталляций."""
     monkeypatch.setattr(cache, "_redis", None, raising=False)
@@ -409,9 +463,7 @@ async def test_ws_endpoint_auth_rejects_bad_token():
     """
     with TestClient(app) as tc:
         try:
-            with tc.websocket_connect(
-                "/ws", subprotocols=["bearer.garbage"]
-            ) as ws:
+            with tc.websocket_connect("/ws", subprotocols=["bearer.garbage"]) as ws:
                 with pytest.raises(Exception):
                     ws.receive_json()
         except WebSocketDisconnect:
@@ -454,20 +506,21 @@ async def test_ws_endpoint_delivers_typing(client_as_user):
     client_typing от alice доставляется bob как user_typing через WS-менеджер.
     Zero DB-touch: состав чата берётся из кеша, БД не касается горячий путь."""
     tc, tokens = client_as_user
-    with tc.websocket_connect(
-        "/ws", subprotocols=[f"bearer.{tokens['alice']}"]
-    ) as ws_a, tc.websocket_connect(
-        "/ws", subprotocols=[f"bearer.{tokens['bob']}"]
-    ) as ws_b:
+    with (
+        tc.websocket_connect("/ws", subprotocols=[f"bearer.{tokens['alice']}"]) as ws_a,
+        tc.websocket_connect("/ws", subprotocols=[f"bearer.{tokens['bob']}"]) as ws_b,
+    ):
         ws_a.send_json({"type": "ping"})
-        assert ws_a.receive_json()["type"] == "pong"
+        assert _recv_with_timeout(ws_a)["type"] == "pong"
 
-        ws_a.send_json({
-            "type": "client_typing",
-            "chat_id": tokens["chat_id"],
-            "text": "привет",
-        })
-        evt = ws_b.receive_json()
+        ws_a.send_json(
+            {
+                "type": "client_typing",
+                "chat_id": tokens["chat_id"],
+                "text": "привет",
+            }
+        )
+        evt = _recv_with_timeout(ws_b)
         assert evt["type"] == "user_typing", evt
         assert evt["chat_id"] == tokens["chat_id"]
         assert evt["typing"] is True
@@ -475,8 +528,10 @@ async def test_ws_endpoint_delivers_typing(client_as_user):
         assert evt["user_id"] == tokens["alice_id"]
 
         # Stop-событие (пустой текст) проходит мимо серверного rate-limit
-        ws_a.send_json({"type": "client_typing", "chat_id": tokens["chat_id"], "text": ""})
-        stop_evt = ws_b.receive_json()
+        ws_a.send_json(
+            {"type": "client_typing", "chat_id": tokens["chat_id"], "text": ""}
+        )
+        stop_evt = _recv_with_timeout(ws_b)
         assert stop_evt["type"] == "user_typing" and stop_evt["typing"] is False
 
 
@@ -484,6 +539,14 @@ async def test_ws_endpoint_delivers_typing(client_as_user):
 def client_as_user(user_alice, user_bob, chat):
     """TestClient + актуальные access-токены alice/bob и id чата (для /ws)."""
     from server import auth as auth_service
+    from server.services.typing import typing_service
+
+    # Изоляция от autouse clean_db: он пересоздаёт схему, но NOT чистит
+    # in-memory состояние typing-сервиса (_last_emit/_local). Между тестами
+    # пары (chat_id, user_id) пересекаются — залипший debounce глушил бы
+    # fan-out, а ghost-подписки рассылать бы события не тем получателям.
+    typing_service._last_emit.clear()
+    typing_service._local.clear()
 
     tokens = {
         "alice": auth_service.create_access_token(user_alice["user_id"]),

@@ -8,6 +8,7 @@
   это признак кражи: вся семья токенов отзывается, событие пишется в
   audit-лог (security_events).
 """
+
 import logging
 from datetime import timedelta
 from typing import Optional
@@ -20,8 +21,9 @@ from server.utils import utc_now
 log = logging.getLogger("meno.sessions")
 
 
-async def issue_refresh_token(db, user_id: int, family: Optional[str] = None,
-                              parent: Optional[str] = None) -> str:
+async def issue_refresh_token(
+    db, user_id: int, family: Optional[str] = None, parent: Optional[str] = None
+) -> str:
     """Создаёт новый refresh-токен (с попыткой записи в переданную сессию db)."""
     token = auth.new_refresh_token()
     fam = family or auth.new_token_family()
@@ -31,14 +33,19 @@ async def issue_refresh_token(db, user_id: int, family: Optional[str] = None,
             "VALUES (:t, :u, :f, :p, 0, :e)"
         ),
         {
-            "t": token, "u": user_id, "f": fam, "p": parent,
+            "t": token,
+            "u": user_id,
+            "f": fam,
+            "p": parent,
             "e": utc_now() + timedelta(days=config.REFRESH_TOKEN_EXPIRE_DAYS),
         },
     )
     return token
 
 
-async def rotate_refresh_token(raw_token: str, ip: Optional[str] = None) -> Optional[dict]:
+async def rotate_refresh_token(
+    raw_token: str, ip: Optional[str] = None
+) -> Optional[dict]:
     """Атомарная ротация refresh-токена.
 
     Возвращает dict {"access_token", "refresh_token"} либо None, если токен
@@ -59,15 +66,24 @@ async def rotate_refresh_token(raw_token: str, ip: Optional[str] = None) -> Opti
         # Переиспользование уже отозванного токена => компрометация всей семьи.
         if row["revoked"]:
             await db.execute(
-                sql_text("UPDATE refresh_tokens SET revoked=1 WHERE family=:f AND revoked=0"),
+                sql_text(
+                    "UPDATE refresh_tokens SET revoked=1 WHERE family=:f AND revoked=0"
+                ),
                 {"f": row["family"]},
             )
-            await db.commit()  # освобождаем write-lock SQLite ДО вложенной audit-транзакции
+            await (
+                db.commit()
+            )  # освобождаем write-lock SQLite ДО вложенной audit-транзакции
             await auth.log_security_event(
-                "refresh_reuse", user_id=row["user_id"], ip=ip,
+                "refresh_reuse",
+                user_id=row["user_id"],
+                ip=ip,
                 detail="Отзыв всей семьи токенов из-за повторного использования",
             )
-            log.warning("Refresh token reuse detected for user %s (family revoked)", row["user_id"])
+            log.warning(
+                "Refresh token reuse detected for user %s (family revoked)",
+                row["user_id"],
+            )
             return None
 
         if database_is_expired(row["expires_at"]):
@@ -75,13 +91,17 @@ async def rotate_refresh_token(raw_token: str, ip: Optional[str] = None) -> Opti
 
         # Ротация: отзываем предка, выдаём потомка той же семьи.
         result = await db.execute(
-            sql_text("UPDATE refresh_tokens SET revoked=1 WHERE token=:t AND revoked=0"),
+            sql_text(
+                "UPDATE refresh_tokens SET revoked=1 WHERE token=:t AND revoked=0"
+            ),
             {"t": raw_token},
         )
         if (result.rowcount or 0) == 0:
             # Гонка: параллельный запрос уже отозвал этот токен.
             await auth.log_security_event(
-                "refresh_race", user_id=row["user_id"], ip=ip,
+                "refresh_race",
+                user_id=row["user_id"],
+                ip=ip,
                 detail="Параллельная ротация одного токена",
             )
             return None

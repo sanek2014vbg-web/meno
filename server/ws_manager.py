@@ -11,6 +11,7 @@
 Heartbeat: сервер periodically отправляет ping-кадры; клиент отвечает
 pong (или просто читает), мёртвые соединения закрываются.
 """
+
 import asyncio
 import json
 import logging

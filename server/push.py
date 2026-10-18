@@ -7,9 +7,9 @@
   long-polling `/api/push/poll` (Этап 3.3 ТЗ). Никаких облачных сервисов;
 - токены клиентов хранятся в БД (таблица push_tokens).
 """
+
 import json
 import logging
-from typing import Optional
 
 from sqlalchemy import text as sql_text
 
@@ -28,7 +28,9 @@ async def register_token(user_id: int, token: str, platform: str = "android") ->
         )
         if existing:
             await db.execute(
-                sql_text("UPDATE push_tokens SET user_id=:u, platform=:p WHERE token=:t"),
+                sql_text(
+                    "UPDATE push_tokens SET user_id=:u, platform=:p WHERE token=:t"
+                ),
                 {"u": user_id, "p": platform[:32], "t": tok},
             )
         else:
@@ -87,12 +89,19 @@ async def _enqueue_outbox(user_id: int, title: str, body: str, data: dict) -> No
                 "INSERT INTO push_outbox (user_id, title, body, data, created_at) "
                 "VALUES (:u, :t, :b, :d, :c)"
             ),
-            {"u": user_id, "t": title[:200], "b": body[:500],
-             "d": json.dumps(data or {}), "c": utc_now()},
+            {
+                "u": user_id,
+                "t": title[:200],
+                "b": body[:500],
+                "d": json.dumps(data or {}),
+                "c": utc_now(),
+            },
         )
 
 
-async def send_to_user(user_id: int, title: str, body: str, data: dict | None = None) -> int:
+async def send_to_user(
+    user_id: int, title: str, body: str, data: dict | None = None
+) -> int:
     """Отправляет уведомление на все устройства пользователя.
 
     Возвращает число успешно доставленных каналов. Если FCM не настроен —
@@ -129,11 +138,20 @@ async def poll_outbox(user_id: int, max_items: int = 20) -> list[dict]:
         if rows:
             ids = [r["id"] for r in rows]
             await db.execute(
-                sql_text("DELETE FROM push_outbox WHERE id IN (" + ",".join(str(i) for i in ids) + ")")
+                sql_text(
+                    "DELETE FROM push_outbox WHERE id IN ("
+                    + ",".join(str(i) for i in ids)
+                    + ")"
+                )
             )
     return [
-        {"id": r["id"], "title": r["title"], "body": r["body"],
-         "data": json.loads(r["data"] or "{}"), "created_at": r["created_at"]}
+        {
+            "id": r["id"],
+            "title": r["title"],
+            "body": r["body"],
+            "data": json.loads(r["data"] or "{}"),
+            "created_at": r["created_at"],
+        }
         for r in rows
     ]
 

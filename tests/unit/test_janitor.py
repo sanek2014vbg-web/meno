@@ -4,11 +4,13 @@
 - cache/manager/chat_member_ids мокаются (unittest.mock.AsyncMock);
 - БД — SQLite из корневого conftest (фикстура clean_db пересоздаёт схему).
 """
+
 import asyncio
 from datetime import timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import pytest_asyncio
 from sqlalchemy import text as sqltext
 
 from server import database
@@ -24,9 +26,18 @@ from server.utils import utc_now
 async def _insert_message(db, **kw):
     """Вставляет сообщение; колонки соответствуют реальной схеме (content)."""
     defaults = dict(
-        chat_id=1, sender_id=1, content="body", ttl_seconds=None,
-        view_once=0, viewed=0, expires_at=None, type="text", e2e=0,
-        client_id=f"c{utc_now().timestamp()}", media_path=None, duration=None,
+        chat_id=1,
+        sender_id=1,
+        content="body",
+        ttl_seconds=None,
+        view_once=0,
+        viewed=0,
+        expires_at=None,
+        type="text",
+        e2e=0,
+        client_id=f"c{utc_now().timestamp()}",
+        media_path=None,
+        duration=None,
     )
     defaults.update(kw)
     await db.execute(
@@ -42,16 +53,61 @@ async def _insert_message(db, **kw):
     )
 
 
-async def _insert_refresh_token(db, user_id=1, token="h", family="f",
-                               expires_at=None, revoked=0):
+async def _insert_refresh_token(
+    db, user_id=1, token="h", family="f", expires_at=None, revoked=0
+):
     await db.execute(
         sqltext(
             "INSERT INTO refresh_tokens (user_id, token, family, expires_at,"
             " revoked, created_at) VALUES (:u, :t, :f, :e, :r, :c)"
         ),
-        {"u": user_id, "t": token, "f": family, "e": expires_at or utc_now(),
-         "r": revoked, "c": utc_now()},
+        {
+            "u": user_id,
+            "t": token,
+            "f": family,
+            "e": expires_at or utc_now(),
+            "r": revoked,
+            "c": utc_now(),
+        },
     )
+
+
+@pytest_asyncio.fixture()
+async def seed_parent_rows(clean_db):
+    """Seed родительских строк для включённых SQLite FK-прагм.
+
+    Спринт v1.0.0: слушатели SQLite (PRAGMA foreign_keys=ON) теперь честно
+    навешиваются на пересоздаваемый в clean_db движок, поэтому INSERT в
+    messages без существующих users/chats падает с IntegrityError. Дворник
+    тестируется поверх реальной схемы — здесь минимальный консистентный
+    набор: пользователь 1/2, чат 1 и участники. Идемпотентно (INSERT OR IGNORE).
+    """
+    async with database.get_db() as db:
+        for uid in (1, 2):
+            await db.execute(
+                sqltext(
+                    "INSERT OR IGNORE INTO users (id, username, password_hash)"
+                    " VALUES (:id, :u, :h)"
+                ),
+                {"id": uid, "u": f"janitor_u{uid}", "h": "x"},
+            )
+        for cid in range(1, 11):
+            await db.execute(
+                sqltext(
+                    "INSERT OR IGNORE INTO chats (id, type, created_by)"
+                    " VALUES (:cid, 'private', 1)"
+                ),
+                {"cid": cid},
+            )
+            for uid in (1, 2):
+                await db.execute(
+                    sqltext(
+                        "INSERT OR IGNORE INTO chat_members (chat_id, user_id)"
+                        " VALUES (:cid, :u)"
+                    ),
+                    {"cid": cid, "u": uid},
+                )
+        await db.commit()
 
 
 @pytest.fixture()
@@ -60,8 +116,7 @@ def mocks():
     with (
         patch.object(janitor_mod, "cache") as cache,
         patch.object(janitor_mod, "manager") as manager,
-        patch.object(janitor_mod, "chat_member_ids",
-                     new_callable=AsyncMock) as members,
+        patch.object(janitor_mod, "chat_member_ids", new_callable=AsyncMock) as members,
     ):
         cache.delete = AsyncMock()
         manager.send_to_users = AsyncMock()
@@ -69,8 +124,7 @@ def mocks():
         yield MagicMock(cache=cache, manager=manager, members=members)
 
 
-
-@pytest.mark.usefixtures("clean_db")
+@pytest.mark.usefixtures("clean_db", "seed_parent_rows")
 class TestJanitorRunOnce:
     async def test_no_expired_messages_is_noop(self, mocks):
         async with database.get_db() as db:
@@ -81,10 +135,12 @@ class TestJanitorRunOnce:
 
     async def test_absolute_ttl_expired_erased_and_broadcast(self, mocks):
         async with database.get_db() as db:
-            await _insert_message(db, chat_id=7,
-                                  expires_at=utc_now() - timedelta(seconds=1))
-            await _insert_message(db, chat_id=7,
-                                  expires_at=utc_now() + timedelta(hours=1))
+            await _insert_message(
+                db, chat_id=7, expires_at=utc_now() - timedelta(seconds=1)
+            )
+            await _insert_message(
+                db, chat_id=7, expires_at=utc_now() + timedelta(hours=1)
+            )
             await db.commit()
 
         assert await JanitorService().run_once() == 1
@@ -104,8 +160,9 @@ class TestJanitorRunOnce:
 
     async def test_legacy_relative_ttl_deadline(self, mocks):
         async with database.get_db() as db:
-            await _insert_message(db, ttl_seconds=10,
-                                  created_at=utc_now() - timedelta(seconds=30))
+            await _insert_message(
+                db, ttl_seconds=10, created_at=utc_now() - timedelta(seconds=30)
+            )
             await db.commit()
         assert await JanitorService().run_once() == 1
 
@@ -116,28 +173,25 @@ class TestJanitorRunOnce:
         assert await JanitorService().run_once() == 0  # ещё не просмотрен
 
         async with database.get_db() as db:
-            await db.execute(sqltext(
-                "UPDATE messages SET viewed = 1"))
+            await db.execute(sqltext("UPDATE messages SET viewed = 1"))
             await db.commit()
         assert await JanitorService().run_once() == 1
 
     async def test_refresh_tokens_hygiene(self, mocks):
         async with database.get_db() as db:
-            await _insert_refresh_token(
-                db, expires_at=utc_now() - timedelta(days=1))
+            await _insert_refresh_token(db, expires_at=utc_now() - timedelta(days=1))
             await db.commit()
         await JanitorService().run_once()
         async with database.get_db() as db:
-            row = await database.aq1(db, "SELECT COUNT(*) AS n"
-                                     " FROM refresh_tokens")
+            row = await database.aq1(db, "SELECT COUNT(*) AS n FROM refresh_tokens")
             assert row["n"] == 0
 
     async def test_grouping_by_chat_one_event_per_chat(self, mocks):
         async with database.get_db() as db:
             for chat in (1, 1, 2):
-                await _insert_message(db, chat_id=chat,
-                                      expires_at=utc_now()
-                                      - timedelta(seconds=5))
+                await _insert_message(
+                    db, chat_id=chat, expires_at=utc_now() - timedelta(seconds=5)
+                )
             await db.commit()
         assert await JanitorService().run_once() == 3
         # send_to_users вызывается ОДИН раз на чат — группировка событий:
@@ -152,36 +206,36 @@ class TestJanitorRunOnce:
     async def test_empty_membership_skips_broadcast(self, mocks):
         mocks.members.return_value = []
         async with database.get_db() as db:
-            await _insert_message(db, expires_at=utc_now()
-                                  - timedelta(seconds=1))
+            await _insert_message(db, expires_at=utc_now() - timedelta(seconds=1))
             await db.commit()
         assert await JanitorService().run_once() == 1
         mocks.manager.send_to_users.assert_not_awaited()
 
 
-@pytest.mark.usefixtures("clean_db")
+@pytest.mark.usefixtures("clean_db", "seed_parent_rows")
 class TestJanitorLifecycle:
     async def test_start_stop_idempotent(self):
         svc = JanitorService()
         with patch.object(svc, "run_once", new_callable=AsyncMock) as run:
             await svc.start(interval=0.01)
-            await svc.start(interval=0.01)          # повторный start — no-op
+            await svc.start(interval=0.01)  # повторный start — no-op
             assert svc._task is not None
             task = svc._task
             await asyncio.sleep(0.05)
             assert run.await_count >= 1
             await svc.stop()
             assert svc._task is None and task.done()
-            await svc.stop()                        # остановка без задачи
+            await svc.stop()  # остановка без задачи
 
     async def test_loop_survives_tick_exception(self):
         svc = JanitorService()
-        boom = AsyncMock(side_effect=[RuntimeError("db down"),
-                                      AsyncMock(return_value=0)()])
+        boom = AsyncMock(
+            side_effect=[RuntimeError("db down"), AsyncMock(return_value=0)()]
+        )
         with patch.object(svc, "run_once", new=boom):
             await svc.start(interval=0.01)
             await asyncio.sleep(0.08)
-            assert boom.await_count >= 2            # цикл НЕ упал на ошибке
+            assert boom.await_count >= 2  # цикл НЕ упал на ошибке
             assert not svc._task.done()
             await svc.stop()
 

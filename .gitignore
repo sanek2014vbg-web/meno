@@ -1,5 +1,8 @@
 __pycache__/
 *.pyc
+.env
+.env.local
+*.env.*
 *.log
 *.db
 *.db-shm

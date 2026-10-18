@@ -6,9 +6,13 @@
    умолчанию / PostgreSQL через MENO_TEST_DATABASE_URL), fakeredis-режим кеша.
 
 Фикстуры (client, auth_factory, clean_db, fake_redis) живут здесь, чтобы быть
-доступными и для tests/, и для server/tests/ независимо от того, какой путь
-указан в pytest testpaths.
+доступными и для tests/unit, и для tests/integration независимо от того,
+какой путь указан в pytest testpaths.
+
+Примечание: E402 допущен осознанно — импорты server.* обязаны выполниться
+ПОСЛЕ установки os.environ (server/config читается однократно при импорте).
 """
+# ruff: noqa: E402
 import os
 import sys
 from pathlib import Path
@@ -29,9 +33,6 @@ os.environ["MENO_DATABASE_URL"] = _TEST_DB
 os.environ.setdefault("MENO_REDIS_URL", "fakeredis://local")
 os.environ["MENO_LOG_ACCESS"] = "0"
 
-import asyncio
-
-import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 
@@ -43,6 +44,33 @@ from server.ws_manager import manager
 
 def _is_sqlite() -> bool:
     return database.DATABASE_URL.startswith("sqlite")
+
+
+def attach_sqlite_listeners(sync_engine) -> None:
+    """Вешает PRAGMA- и lower()-хуки SQLite на (пере)созданный движок.
+
+    Дефект-фикс №2 (release v1.0.0): фикстура clean_db пересоздаёт engine для
+    каждого теста, но слушатели event-регистрации живут на СТАРОМ объекте
+    sync_engine — новые пулы теряли Unicode-LOWER и busy_timeout, из-за чего
+    кириллический поиск падал с 'has_more is False' (SQLite LOWER знает только
+    ASCII). Функция идемпотентна: sqlalchemy.event listens_for не дублирует
+    обработчик при повторной навеске того же callables на тот же объект.
+    """
+    from sqlalchemy import event
+
+    # Импорт внутри функции: IS_SQLITE вычисляется при импорте connection,
+    # а DATABASE_URL фиксируется этим conftest ДО первого импорта server.*.
+    import server.db.connection as dbconn
+
+    # Ветка PG-слушателя существует только когда движок собран под PostgreSQL;
+    # на SQLite-тесте берём PRAGMA-хук (Unicode lower + busy_timeout + WAL).
+    target = getattr(dbconn, "_sqlite_pragmas", None) or getattr(
+        dbconn, "_pg_session_settings", None
+    )
+    if target is None:  # pragma: no cover - защита от рефакторинга connection.py
+        return
+    if not event.contains(sync_engine, "connect", target):
+        event.listen(sync_engine, "connect", target)
 
 
 def _sqlite_connect_args() -> dict:
@@ -77,6 +105,7 @@ async def clean_db():
         else:
             kwargs["connect_args"] = _sqlite_connect_args()
         database.engine = create_async_engine(database.DATABASE_URL, **kwargs)
+        attach_sqlite_listeners(database.engine.sync_engine)
         database.AsyncSessionLocal.configure(bind=database.engine)
 
     async with database.engine.begin() as conn:
