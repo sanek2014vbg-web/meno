@@ -1,0 +1,22 @@
+# Конфигурация Gitleaks для MeNo Messenger.
+# Подключается из .pre-commit-config.yaml (--config=.gitleaks.toml).
+# Наследует все встроенные правила детектирования секретов, но добавляет
+# allowlist строго для тестовых данных и моков: фейковые ключи/токены в
+# тестах не должны блокировать коммиты команды.
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "test-data-allowlist"
+description = "Fake secrets inside test fixtures and mocks are allowed"
+regex = '''(?s).*'''
+
+[rules.allowlist]
+paths = [
+    '''^tests/''',
+    '''^server/tests/''',
+    '''^client/tests/''',
+    '''conftest\.py$''',
+    '''\.env\.example$''',
+]

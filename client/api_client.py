@@ -266,6 +266,20 @@ class ApiClient:
     async def mark_viewed(self, message_id: int) -> dict:
         return await self._req("POST", f"/api/messages/{message_id}/view", json={})
 
+    async def update_message_status(
+        self, message_id: int, status: str, ghost: bool = False
+    ) -> dict:
+        """PATCH /messages/{id}/status (Этап 7.3, «Живая галочка»).
+
+        status: 'delivered' | 'read'; сервер идемпотентно применит переход
+        только вперёд по шкале рангов sent(0)->delivered(1)->read(2).
+        ghost=True — Ghost Mode: read тихо понижается до delivered.
+        """
+        return await self._req(
+            "PATCH", f"/api/messages/{message_id}/status",
+            json={"status": status, "ghost": ghost},
+        )
+
     async def delete_message(self, message_id: int) -> dict:
         return await self._req("DELETE", f"/api/messages/{message_id}")
 

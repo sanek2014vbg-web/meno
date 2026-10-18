@@ -4,10 +4,13 @@
 доступа к данным. Это позволяет миграциям Alembic и тестам импортировать
 схему, не поднимая connection pool.
 """
+import enum
+
 from sqlalchemy import (
     Boolean,
     Column,
     DateTime,
+    Enum as SAEnum,
     ForeignKey,
     Index,
     Integer,
@@ -21,6 +24,50 @@ from sqlalchemy.orm import DeclarativeBase
 
 class Base(AsyncAttrs, DeclarativeBase):
     """Базовый класс для всех моделей БД."""
+
+
+# --- Enums ---
+
+
+class MessageStatus(str, enum.Enum):
+    """Линейный жизненный цикл сообщения (Этап 7.3).
+
+    ВАЖНО: сравнение «больше/меньше» в SQL идёт по СЛОВАРНОМУ порядку
+    строковых значений, поэтому сам порядок объявления здесь ничего не
+    гарантирует. Корректность обеспечивает константа _STATUS_ORDER и
+    функция status_rank(): 'sent' < 'delivered' < 'read'. Изменение
+    строковых значений потребует UPDATE-маппинга в миграции — см.
+    migrations/versions/b7c3d9e1f2a4_message_status.py.
+    """
+
+    sent = "sent"            # принято сервером (базовое состояние после INSERT)
+    delivered = "delivered"  # доставлено на устройство получателя (ACK клиента)
+    read = "read"            # прочитано получателем
+
+
+# Ранг статуса для защиты от регрессии в условном UPDATE (Этап 7.3).
+_STATUS_ORDER: tuple[MessageStatus, ...] = (
+    MessageStatus.sent,
+    MessageStatus.delivered,
+    MessageStatus.read,
+)
+
+
+def status_rank(status: MessageStatus) -> int:
+    """Позиция статуса на линейной шкале sent(0) -> delivered(1) -> read(2)."""
+    return _STATUS_ORDER.index(status)
+
+
+# native_enum=False — критично для совместимости SQLite (тесты) и PostgreSQL 16
+# (прод): SQLAlchemy создаёт VARCHAR + CHECK вместо нативного PG-типа ENUM.
+# Без этого ALTER TYPE на легаси-БД (status='open') падал бы при конвертации.
+MESSAGE_STATUS_ENUM = SAEnum(
+    MessageStatus,
+    name="message_status",
+    native_enum=False,
+    length=16,
+    create_constraint=False,
+)
 
 
 # --- Models ---
@@ -98,12 +145,21 @@ class Message(Base):
     # Идемпотентность отправки: клиентский idempotency-key (уникален в рамках чата)
     client_id = Column(String(64), nullable=True)
     created_at = Column(DateTime, server_default=text("CURRENT_TIMESTAMP"))
+    # --- Этап 7.3: Статусы сообщений sent -> delivered -> read ---
+    # Переход ТОЛЬКО вперёд по линейной шкале (sent < delivered < read);
+    # защита от гонок и регрессии — в условном UPDATE маршрута PATCH
+    # /messages/{id}/status (см. server/routes_messages.py).
+    status = Column(MESSAGE_STATUS_ENUM, nullable=False, server_default="sent")
+    delivered_at = Column(DateTime(timezone=True))
+    read_at = Column(DateTime(timezone=True))
 
     __table_args__ = (
         Index("idx_messages_chat_id_id_desc", "chat_id", "id"),
         Index("idx_messages_sender_created", "sender_id", "created_at"),
         Index("idx_messages_ttl", "ttl_seconds"),
         Index("idx_messages_expires_at", "expires_at"),
+        # Статусы (Этап 7.3): быстрые выборки «непрочитанное в чате»
+        Index("idx_messages_chat_status", "chat_id", "status"),
         # Идемпотентность отправки: один client_id не может повториться в чате
         Index("uq_messages_chat_client", "chat_id", "client_id", unique=True),
     )
