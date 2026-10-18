@@ -17,8 +17,10 @@ from sqlalchemy import text  # noqa: F401 (реэкспорт для совме�
 from server.config import DATABASE_URL, IS_SQLITE  # noqa: F401 (совместимость фасада)
 from server.db.connection import AsyncSessionLocal, engine
 from server.db.models_base import (
+    MESSAGE_STATUS_ENUM,
     Base,
     Chat,
+    MessageStatus,
     ChatMember,
     Message,
     PushOutbox,
@@ -42,6 +44,8 @@ from server.db.connection import close_pool  # noqa: F401 (совместимо�
 
 __all__ = [
     "AsyncSessionLocal",
+    "MESSAGE_STATUS_ENUM",
+    "MessageStatus",
     "Base",
     "DATABASE_URL",
     "IS_SQLITE",

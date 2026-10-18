@@ -18,3 +18,20 @@ repos:
         args: ["--fix", "--exit-non-zero-on-fix"]
       # Форматирование (черный-совместимый стиль, тот же что в CI)
       - id: ruff-format
+
+  # Сканирование на утечку секретов (пароли, API-ключи, токены) до коммита.
+  # Ложные срабатывания на фейковые ключи в тестовых данных и примерах
+  # исключаются через .gitleaks.toml (allowlist) + exclude-паттерны хука.
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.18.4
+    hooks:
+      - id: gitleaks
+        args: ["--config=.gitleaks.toml", "--redact"]
+        exclude: >
+          (?x)^(
+              tests/.*|
+              server/tests/.*|
+              client/tests/.*|
+              conftest\.py|
+              .*\.env\.example
+          )$

@@ -32,7 +32,33 @@ from ui.message_model import (
     _fmt_time,
     _now_utc,
     _parse_ts,
+    next_status,
+    status_icon,
+    status_icon_color,
 )
+
+
+# ---------------------------------------------------------------------------
+# «Живая галочка» (Этап 7.3): статус -> Material-иконка ft.Icon
+# ---------------------------------------------------------------------------
+
+#: Имя иконки статуса — делег в чистую изолированную функцию message_model.
+_STATUS_ICON = status_icon
+#: Цвет прочитанной галочки (ft.colors.BLUE по ТЗ спринта 3).
+_READ_COLOR = ft.Colors.BLUE
+
+
+def status_icon_control(status: MessageStatus, sub_color: str) -> ft.Icon:
+    """Собирает ft.Icon для статуса: sent — одна серая ✓, delivered — две
+    серые ✓✓, read — две синие ✓✓ (BLUE). Чистая функция без побочных
+    эффектов — используется и при первичной отрисовке пузыря, и в
+    MessageRow.update_status_ui (O(1) точечное обновление)."""
+    return ft.Icon(
+        status_icon(status),
+        size=15,
+        color=status_icon_color(status, sub_color, _READ_COLOR),
+        tooltip=status.value,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -284,6 +310,170 @@ class SafetyNumberDialog(_DismissableDialog):
 
 
 # ---------------------------------------------------------------------------
+# MessageRow — пузырёк сообщения с «живой галочкой» (Этап 7.3, Спринт 3)
+# ---------------------------------------------------------------------------
+
+
+class MessageRow(ft.Container):
+    """Один ряд списка сообщений: пузырь + мета-строка (время, галочка).
+
+    Ключевое свойство для производительности: контрол хранит прямые ссылки
+    на свои дочерние Text/Icon, поэтому ``update_status_ui`` меняет статус
+    за O(1) — без пересборки пузыря и без линейного поиска по списку.
+    Перерисовка строго асинхронная (``await self.update_async()``) — UI-поток
+    Flet не блокируется сетевыми/WS-событиями.
+    """
+
+    def __init__(self, message: Message, mine: bool, colors: dict, screen: "ChatScreen"):
+        super().__init__()
+        self.message = message
+        self.mine = mine
+        self._colors = colors
+        self._screen = screen
+        c = colors
+
+        parts: list[ft.Control] = []
+        author_name = "" if mine else screen._author_name(message.sender_id)
+        self._author_lbl: Optional[ft.Text] = None
+        if author_name:
+            self._author_lbl = ft.Text(
+                author_name, size=11, weight=ft.FontWeight.BOLD, color=c["accent"]
+            )
+            parts.append(self._author_lbl)
+
+        self._reply_box: Optional[ft.Container] = None
+        if message.reply_preview and message.reply_to_id:
+            self._reply_text = ft.Text(
+                message.reply_preview,
+                size=11,
+                color=c["sub"],
+                max_lines=1,
+                overflow=ft.TextOverflow.ELLIPSIS,
+            )
+            self._reply_box = ft.Container(
+                padding=ft.Padding(8, 4, 8, 4),
+                border=ft.border.only(left=ft.BorderSide(3, c["accent"])),
+                bgcolor="#00000010",
+                border_radius=4,
+                content=self._reply_text,
+            )
+            parts.append(self._reply_box)
+
+        self._body = ft.Text(message.text, size=14, selectable=True)
+        self._edited_lbl: Optional[ft.Text] = None
+        if message.edited_at:
+            self._edited_lbl = ft.Text("(ред.)", size=10, italic=True, color=c["sub"])
+            parts.append(ft.Row([self._body, self._edited_lbl], spacing=4, tight=True))
+        else:
+            parts.append(self._body)
+
+        self._reactions_row: Optional[ft.Row] = None
+        if message.reactions:
+            self._reactions_row = self._build_reactions(message)
+            parts.append(self._reactions_row)
+
+        # --- Мета: время + «живая галочка» (только для исходящих) ---
+        self._time_lbl = ft.Text(_fmt_time(message.created_at), size=10, color=c["sub"])
+        meta: list[ft.Control] = [self._time_lbl]
+        self._status_icon: Optional[ft.Icon] = None
+        if mine:
+            self._status_icon = status_icon_control(message.status, c["sub"])
+            meta.append(self._status_icon)
+        parts.append(ft.Row(meta, spacing=4, alignment=ft.MainAxisAlignment.END))
+
+        bubble = ft.Container(
+            content=ft.Column(parts, spacing=4, tight=True),
+            padding=ft.Padding(12, 8, 12, 8),
+            bgcolor=c["bubble_me"] if mine else c["bubble_other"],
+            border_radius=14,
+        )
+        self.content = ft.GestureDetector(
+            on_tap_down=lambda e: self._screen._on_bubble_tap(e, self.message),
+            on_long_press=lambda e: self._screen._open_context(self.message),
+            content=bubble,
+        )
+        self.alignment = (
+            ft.MainAxisAlignment.END if mine else ft.MainAxisAlignment.START
+        )
+
+    @staticmethod
+    def _build_reactions(m: Message) -> ft.Row:
+        chips = [
+            ft.Container(
+                padding=ft.Padding(6, 2, 6, 2),
+                bgcolor="#00000012",
+                border_radius=10,
+                content=ft.Text(f"{emoji} {len(users)}", size=11),
+            )
+            for emoji, users in sorted(m.reactions.items())
+        ]
+        return ft.Row(chips, spacing=4, wrap=True)
+
+    # ---------- Публичный API точечных обновлений (O(1)) ----------
+
+    async def update_status_ui(self, new_status: MessageStatus) -> bool:
+        """Перекрашивает «живую галочку» в новый статус.
+
+        Монотонный merge через next_status: запоздалое WS-событие
+        «delivered» не откатит синие галочки назад к серым. Возвращает
+        True, если внешний вид реально изменился (и был выполнен
+        await update_async); False — no-op без перерисовки.
+        """
+        merged = next_status(self.message.status, new_status)
+        if merged is self.message.status or self._status_icon is None:
+            return False
+        self.message.status = merged
+        self._status_icon.icon = _STATUS_ICON(merged)
+        self._status_icon.color = status_icon_color(
+            merged, self._colors["sub"], _READ_COLOR
+        )
+        self._status_icon.tooltip = merged.value
+        try:
+            await self.update_async()  # только async-перерисовка — без фризов
+        except Exception:
+            pass  # контрол отвязан от страницы (чат закрыт) — молча деградируем
+        return True
+
+    def refresh_body(self, text: str, edited_at) -> None:
+        self.message.text = text
+        self.message.edited_at = edited_at
+        if edited_at is not None and self._edited_lbl is None:
+            self._edited_lbl = ft.Text("(ред.)", size=10, italic=True, color=self._colors["sub"])
+            row = ft.Row([self._body, self._edited_lbl], spacing=4, tight=True)
+            col = self.content.content.content
+            for i, ctl in enumerate(col.controls):
+                if ctl is self._body:
+                    col.controls[i] = row
+                    break
+        self._body.value = text
+
+    def refresh_reactions(self) -> None:
+        col = self.content.content.content
+        if self._reactions_row is None:
+            if not self.message.reactions:
+                return
+            self._reactions_row = self._build_reactions(self.message)
+            col.controls.insert(-1, self._reactions_row)
+        else:
+            self._reactions_row.controls = self._build_reactions(self.message).controls
+
+    def refresh_reply(self, preview: Optional[str]) -> None:
+        if preview and self._reply_box is not None:
+            self._reply_text.value = preview
+        elif preview and self._reply_box is None:
+            self.message.reply_preview = preview
+            self._reply_text = ft.Text(preview, size=11, color=self._colors["sub"],
+                                       max_lines=1, overflow=ft.TextOverflow.ELLIPSIS)
+            self._reply_box = ft.Container(
+                padding=ft.Padding(8, 4, 8, 4),
+                border=ft.border.only(left=ft.BorderSide(3, self._colors["accent"])),
+                bgcolor="#00000010", border_radius=4, content=self._reply_text)
+            col = self.content.content.content
+            insert_at = 1 if self._author_lbl is not None else 0
+            col.controls.insert(insert_at, self._reply_box)
+
+
+# ---------------------------------------------------------------------------
 # Контроллер экрана
 # ---------------------------------------------------------------------------
 
@@ -457,6 +647,13 @@ class ChatScreen:
         # v2.0 Пункт 2: локальные таймеры-страховки по expires_at
         # (если WS-событие message_delete потерялось — карточка сгорит сама).
         self._burn_tasks: dict[int, asyncio.TimerHandle] = {}
+        # Этап 7.3 «Живая галочка»: хеш-указатель id -> MessageRow для O(1)
+        # точечного обновления статусов из WS-цикла без обхода списка.
+        self.rows_by_id: dict[int, "MessageRow"] = {}
+        # Идемпотентность ACK на клиенте: множества уже отправленных статусов
+        # (повторный delivered/read за одну сессию экрана не уйдёт в сеть).
+        self._delivered_acked: set[int] = set()
+        self._read_acked: set[int] = set()
 
     @property
     def page(self) -> ft.Page:
@@ -497,6 +694,12 @@ class ChatScreen:
 
         self.list_view = ft.ListView(
             expand=True, spacing=6, reverse=False, auto_scroll=True
+        )
+        # Этап 7.3: скролл вниз (event_type scroll_end у нижнего края) —
+        # отмечаем видимые непрочитанные сообщения как прочитанные.
+        # require_theme=True включает обратную связь extent/pixels в Flet 1.x.
+        self.list_view.on_scroll = ft.ControlEvent(
+            self._on_list_scroll, wait=50, require_theme=True
         )
 
         # v2.0 Пункт 9: анимированный индикатор «печатает…» под списком сообщений
@@ -540,6 +743,9 @@ class ChatScreen:
             spacing=0,
         )
         await self.load_history()
+        # Этап 7.3: экран открыт — помечаем видимые (последние) входящие
+        # непрочитанные сообщения как прочитанные (best-effort, без await).
+        asyncio.ensure_future(self.mark_visible_read())
         return self.root
 
     # ==================== Данные ====================
@@ -555,6 +761,10 @@ class ChatScreen:
             if not (m.get("expires_at") and _parse_ts(m["expires_at"]) <= now)
         ]
         self.index_by_id = {m.id: m for m in self.messages if m.id is not None}
+        # Этап 7.3: ACK «delivered» для входящих, ещё не доставленных серверу.
+        for msg in self.messages:
+            if msg.sender_id != self.my_id and msg.id is not None:
+                asyncio.ensure_future(self._ack_delivered(msg))
         self._render_all()
         for msg in self.messages:
             self._schedule_burn(msg)
@@ -576,6 +786,12 @@ class ChatScreen:
     async def _api_read(self, message_id: int) -> dict:
         return await self.app.api.mark_viewed(message_id)
 
+    async def _api_status(self, message_id: int, status: str, ghost: bool) -> dict:
+        """PATCH /messages/{id}/status — единая точка ACK статусов (Этап 7.3)."""
+        return await self.app.api.update_message_status(
+            message_id, status, ghost=ghost
+        )
+
     async def _api_peer_pubkey(self) -> tuple[Optional[str], Optional[str]]:
         """Возвращает (pubkey, error) публичный ключ собеседника для приватного чата."""
         try:
@@ -592,88 +808,18 @@ class ChatScreen:
 
     def _render_all(self) -> None:
         self.list_view.controls.clear()
+        self.rows_by_id.clear()
         for msg in self.messages:
             self.list_view.controls.append(self._bubble(msg))
         self.list_view.update()
 
     def _bubble(self, m: Message) -> ft.Control:
-        c = self.c
-        mine = m.sender_id == self.my_id
-
-        author = "" if mine else self._author_name(m.sender_id)
-        parts: list[ft.Control] = []
-        if author:
-            parts.append(
-                ft.Text(author, size=11, weight=ft.FontWeight.BOLD, color=c["accent"])
-            )
-        if m.reply_preview and m.reply_to_id:
-            parts.append(
-                ft.Container(
-                    padding=ft.Padding(8, 4, 8, 4),
-                    border=ft.border.only(left=ft.BorderSide(3, c["accent"])),
-                    bgcolor="#00000010",
-                    border_radius=4,
-                    content=ft.Text(
-                        m.reply_preview,
-                        size=11,
-                        color=c["sub"],
-                        max_lines=1,
-                        overflow=ft.TextOverflow.ELLIPSIS,
-                    ),
-                )
-            )
-        body = ft.Text(m.text, size=14, selectable=True)
-        if m.edited_at:
-            body = ft.Row(
-                [body, ft.Text("(ред.)", size=10, italic=True, color=c["sub"])],
-                spacing=4,
-                tight=True,
-            )
-        parts.append(body)
-
-        if m.reactions:
-            chips = [
-                ft.Container(
-                    padding=ft.Padding(6, 2, 6, 2),
-                    bgcolor="#00000012",
-                    border_radius=10,
-                    content=ft.Text(f"{emoji} {len(users)}", size=11),
-                )
-                for emoji, users in sorted(m.reactions.items())
-            ]
-            parts.append(ft.Row(chips, spacing=4, wrap=True))
-
-        meta: list[ft.Control] = [
-            ft.Text(_fmt_time(m.created_at), size=10, color=c["sub"])
-        ]
-        if mine:
-            glyph = STATUS_GLYPH[m.status]
-            meta.append(
-                ft.Text(
-                    glyph,
-                    size=10,
-                    color="#16a34a"
-                    if m.status in (MessageStatus.READ, MessageStatus.DELIVERED)
-                    else c["sub"],
-                )
-            )
-        parts.append(ft.Row(meta, spacing=4, alignment=ft.MainAxisAlignment.END))
-
-        bubble = ft.Container(
-            content=ft.Column(parts, spacing=4, tight=True),
-            padding=ft.Padding(12, 8, 12, 8),
-            bgcolor=c["bubble_me"] if mine else c["bubble_other"],
-            border_radius=14,
-        )
-        wrapper = ft.GestureDetector(
-            on_tap_down=lambda e, msg=m: self._on_bubble_tap(e, msg),
-            on_long_press=lambda e, msg=m: self._open_context(msg),
-            content=bubble,
-        )
-        return ft.Row(
-            [wrapper],
-            alignment=ft.MainAxisAlignment.END if mine else ft.MainAxisAlignment.START,
-        )
+        """Строит ряд сообщения и регистрирует его в rows_by_id (O(1)-поиск)."""
+        row = MessageRow(m, m.sender_id == self.my_id, self.c, self)
+        m._row = row  # back-link для замены строки черновика при подтверждении
+        if m.id is not None:
+            self.rows_by_id[m.id] = row
+        return row
 
     def _context_menu(self, m: Message) -> list[ft.Control]:
         items: list[ft.Control] = [
@@ -806,6 +952,10 @@ class ChatScreen:
             res = await self._api_send(text, tx, reply_to)
             confirmed = Message.from_server(res, self.my_id)
             self._replace_message(draft, confirmed)
+            # Этап 7.3: собственное входящее-эхо (другое устройство в том же
+            # чате) тоже требует ACK; своё сообщение серверу не «читаем».
+            if confirmed.sender_id != self.my_id and confirmed.id is not None:
+                asyncio.ensure_future(self._ack_delivered(confirmed))
         except Exception as exc:
             draft.status = MessageStatus.FAILED
             draft.failed = True
@@ -840,11 +990,112 @@ class ChatScreen:
         except Exception:
             pass  # статус прочтения — best-effort, не критично для UX
 
+    # ==================== Статусы: ACK + Ghost Mode (Этап 7.3) ====================
+
+    def ghost_mode_enabled(self) -> bool:
+        """Локальная настройка «Призрачное чтение» (crypto-хранилище клиента).
+
+        Значение по умолчанию — False; при включённом режиме клиент шлёт
+        PATCH read с ghost=True, и сервер оставляет физический статус
+        delivered (синие галочки собеседник не увидит).
+        """
+        try:
+            return bool(crypto.get_setting("ghost_mode", False))
+        except Exception:
+            return False
+
+    async def _ack_status(
+        self, message_id: int, status: str, acked: set[int]
+    ) -> Optional[dict]:
+        """Один best-effort PATCH статуса с клиентской дедупликацией.
+
+        ``acked`` — множество id, для которых этот статус уже отправлялся
+        в текущей сессии экрана: повторный вызов не уйдёт в сеть (экономия
+        трафика); сервер в любом случае идемпотентен (условный UPDATE по
+        числовому рангу), поэтому потеря/повтор события безопасны.
+        """
+        if message_id in acked:
+            return None
+        acked.add(message_id)
+        ghost = status == "read" and self.ghost_mode_enabled()
+        try:
+            return await self._api_status(message_id, status, ghost)
+        except Exception:
+            acked.discard(message_id)  # сеть упала — разрешим повтор
+            return None
+
+    async def _ack_delivered(self, m: Message) -> None:
+        """ACK «получено»: входящее сообщение доставлено на устройство."""
+        if m.id is None or m.sender_id == self.my_id:
+            return
+        res = await self._ack_status(m.id, "delivered", self._delivered_acked)
+        if res and res.get("changed"):
+            # Собеседник увидит вторую серую галочку — обновим и свой UI
+            # (актуально для реплик собственных сообщений других устройств).
+            row = self.rows_by_id.get(m.id)
+            if row is not None and row.mine:
+                await row.update_status_ui(MessageStatus.DELIVERED)
+
+    async def mark_visible_read(self) -> None:
+        """Отметить прочитанными видимые непрочитанные входящие сообщения.
+
+        ListView с auto_scroll показывает хвост истории, поэтому «видимыми»
+        считаем последние VISIBLE_TAIL сообщений списка. Вызывается при
+        открытии экрана и при скролле вниз (on_scroll_bottom_reached).
+        """
+        tail = self.messages[-self.VISIBLE_TAIL:]
+        for m in tail:
+            if (
+                m.id is not None
+                and m.sender_id != self.my_id
+                and self.my_id not in m.read_by
+            ):
+                await self._send_read(m)
+
+    async def _send_read(self, m: Message) -> None:
+        """PATCH read (или ghost-delivered) + локальный merge статуса."""
+        if m.id is None:
+            return
+        res = await self._ack_status(m.id, "read", self._read_acked)
+        if res is None:
+            return
+        m.read_by.add(self.my_id)
+        # Ghost Mode: сервер тихо вернул delivered — галочки у нас тоже
+        # не должны «перепрыгнуть» в read (честная локальная симметрия).
+        applied = MessageStatus(res.get("status", "read"))
+        row = self.rows_by_id.get(m.id)
+        if row is not None and row.mine:
+            await row.update_status_ui(applied)
+        elif m.sender_id != self.my_id:
+            m.status = next_status(m.status, applied)
+
+    def on_scroll_bottom_reached(self) -> None:
+        """Хук скролла: пользователь доскроллил до низа — читаем видимое."""
+        asyncio.ensure_future(self.mark_visible_read())
+
+    def _on_list_scroll(self, e: ft.ScrollEvent) -> None:
+        """on_scroll ListView: срабатывает на scroll_end у нижнего края.
+
+        max_extent может быть None (контент ещё не измерен) — тогда событие
+        игнорируем; auto_scroll сам прокрутит к хвосту и ACK придёт через
+        mark_visible_read при открытии экрана / приходе нового сообщения.
+        """
+        if (
+            e.event_type == ft.ScrollEventType.SCROLL_END
+            and e.max_extent is not None
+            and e.pixels is not None
+            and e.pixels >= e.max_extent - 48
+        ):
+            self.on_scroll_bottom_reached()
+
     # ==================== Статусы (WS) ====================
 
     # ---------- v2.0 Пункт 9: Debounce-контроллер «печатает» ----------
     TYPING_DEBOUNCE_SECONDS = 2.0  # не чаще одного client_typing в 2 секунды
     TYPING_STOP_DELAY_SECONDS = 5.0  # «перестал печатать» после паузы ввода
+    #: Этап 7.3: сколько последних сообщенийListView считает «видимыми»
+    #: при открытии экрана / скролле вниз (эвристика высоты вьюпорта).
+    VISIBLE_TAIL = 15
 
     def on_input_change(self, e) -> None:
         """on_change TextField: троттлинг отправки client_typing по WebSocket.
@@ -928,24 +1179,20 @@ class ChatScreen:
         if etype == "user_typing":
             self._handle_typing_event(ev)
             return
-        if etype != "message_status" and etype != "message":
+        # Этап 7.3 «Живая галочка»: серверный broadcast статуса —
+        # message_status / STATUS_UPDATE (алиас). Обработка O(1): хеш id->row.
+        if etype in ("message_status", "STATUS_UPDATE"):
+            asyncio.ensure_future(self._handle_status_update(ev))
+            return
+        if etype != "message":
             # Фолбэк: часть событий приходит плоским payload'ом из ws_manager.
             if "status" not in ev and etype not in ("react", "edited", "reaction"):
                 return
-        kind = ev.get("kind") or etype
+        kind = ev.get("kind") or ev.get("status") or etype
         msg_id = ev.get("message_id") or ev.get("id")
         if kind in ("delivered", "read"):
-            m = self.index_by_id.get(int(msg_id)) if msg_id else None
-            if m is None:
-                return
-            who = int(ev.get("user_id", 0))
-            if kind == "read":
-                m.read_by.add(who)
-            if m.sender_id == self.my_id:
-                m.status = (
-                    MessageStatus.READ if kind == "read" else MessageStatus.DELIVERED
-                )
-                self._refresh_bubble(m)
+            awaitable = self._handle_status_update(ev)
+            asyncio.ensure_future(awaitable)
         elif kind == "react":
             m = self.index_by_id.get(int(msg_id)) if msg_id else None
             if m is not None:
@@ -972,7 +1219,42 @@ class ChatScreen:
             self.list_view.controls.append(self._bubble(incoming))
             self.list_view.update()
             if incoming.sender_id != self.my_id:
-                asyncio.ensure_future(self._mark_read(incoming))
+                # Этап 7.3: WS-доставка на устройство => ACK delivered,
+                # а если экран открыт и сообщение в видимом хвосте — read.
+                asyncio.ensure_future(self._ack_delivered(incoming))
+                if len(self.messages) <= self.VISIBLE_TAIL:
+                    asyncio.ensure_future(self._send_read(incoming))
+
+    async def _handle_status_update(self, ev: dict) -> None:
+        """Перехват STATUS_UPDATE/message_status: O(1) поиск row + перекраска.
+
+        Событие несёт {message_id, status('delivered'|'read'), reader/user}.
+        Поиск сообщения в открытом списке — через хеш-таблицу rows_by_id
+        («Грокаем алгоритмы»: dict вместо линейного скана). Статус модели
+        обновляется монотонно (next_status), UI-ряд перекрашивается строго
+        через await update_async() внутри MessageRow.update_status_ui.
+        """
+        msg_id = ev.get("message_id") or ev.get("id")
+        raw_status = ev.get("status") or ev.get("kind")
+        if msg_id is None or raw_status not in ("delivered", "read"):
+            return
+        try:
+            new_status = MessageStatus(raw_status)
+        except ValueError:
+            return
+        mid = int(msg_id)
+        m = self.index_by_id.get(mid)
+        if m is None:
+            return  # сообщение не из этого чата/ещё не загружено
+        who = int(ev.get("reader_id") or ev.get("user_id") or 0)
+        if raw_status == "read" and who:
+            m.read_by.add(who)
+        row = self.rows_by_id.get(mid)
+        if row is not None:
+            await row.update_status_ui(new_status)
+        else:
+            # Ряд ещё не отрисован (draft без id) — только модель.
+            m.status = next_status(m.status, new_status)
 
     # ==================== E2E-верификация ====================
 
@@ -1008,48 +1290,38 @@ class ChatScreen:
                 break
         if new.id is not None:
             self.index_by_id[new.id] = new
-        idx = (
-            self.list_view.controls.index(self._find_row_for(old))
-            if self._find_row_for(old)
-            else -1
-        )
-        if idx >= 0:
-            self.list_view.controls[idx] = self._bubble(new)
+        # Черновик (MessageRow с id=None) меняем на подтверждённый ряд на
+        # месте — без пересборки всего списка; rows_by_id пополняется в _bubble.
+        old_row = getattr(old, "_row", None)
+        controls = self.list_view.controls
+        idx = -1
+        if old_row is not None:
+            for i, ctl in enumerate(controls):
+                if ctl is old_row:
+                    idx = i
+                    break
+        row = self._bubble(new)
+        if 0 <= idx < len(controls):
+            controls[idx] = row
         else:
-            self.list_view.controls.append(self._bubble(new))
+            controls.append(row)
         self.list_view.update()
 
-    def _find_row_for(self, m: Message) -> Optional[ft.Control]:
-        # Пул строк сопоставляется по тексту+времени черновика (id ещё нет).
-        for row in self.list_view.controls:
-            container = getattr(row, "controls", [None])[0]
-            gesture = getattr(container, "content", None)
-            inner = getattr(gesture, "content", None)
-            col = getattr(inner, "content", None)
-            texts = getattr(col, "controls", []) if col else []
-            first_body = next(
-                (t for t in texts if isinstance(t, ft.Text) and t.size == 14), None
-            )
-            if first_body is not None and first_body.value == m.text and m.id is None:
-                return row
-        return None
-
     def _refresh_bubble(self, m: Message) -> None:
-        for i, row in enumerate(self.list_view.controls):
-            if self._row_matches(row, m):
-                self.list_view.controls[i] = self._bubble(m)
-                self.list_view.update()
-                return
-        # Черновик без id уже заменён в _replace_message; сюда не попадаем.
+        """Точечная перерисовка одного ряда (O(1) через rows_by_id).
 
-    def _row_matches(self, row: ft.Control, m: Message) -> bool:
-        container = getattr(row, "controls", [None])[0]
-        gesture = getattr(container, "content", None)
-        inner = getattr(gesture, "content", None)
-        col = getattr(inner, "content", None)
-        texts = getattr(col, "controls", []) if col else []
-        body = next((t for t in texts if isinstance(t, ft.Text) and t.size == 14), None)
-        return body is not None and body.value == m.text
+        Используется только для контентных правок (edit/reaction): модель уже
+        обновлена, нужно отправить изменённое дерево контролов на страницу.
+        Статусные изменения делают MessageRow.update_status_ui напрямую.
+        """
+        row = self.rows_by_id.get(m.id) if m.id is not None else None
+        if row is None:
+            row = getattr(m, "_row", None)
+        if row is not None:
+            try:
+                row.update()
+            except Exception:
+                pass
 
     def _snack(self, text: str) -> None:
         sb = getattr(self.app, "snack", None)

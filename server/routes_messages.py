@@ -3,6 +3,7 @@
 Ключевые свойства (ТЗ):
 - курсорная пагинация истории и поиска (Этап 4.4);
 - идемпотентность отправки по client_id + дедупликация (Этап 4.5);
+- статусы сообщений sent -> delivered -> read с защитой от гонок (Этап 7.3);
 - транзакционная запись: INSERT сообщения и commit в одной сессии, WS/push
   — только после успешного коммита;
 - полнотекстовый поиск с поддержкой кириллицы: на PG используется
@@ -17,8 +18,9 @@ from pydantic import BaseModel, Field
 from sqlalchemy import text as sql_text
 from sqlalchemy.exc import IntegrityError
 
-from server import auth, config, database, push as push_service
+from server import config, database, push as push_service
 from server.db.connection import engine
+from server.db.models_base import MessageStatus, status_rank
 from server.deps import get_current_user, is_chat_member
 from server.rate_limit import user_key, limiter
 from server.utils import as_utc, utc_now
@@ -85,6 +87,10 @@ class MessageResponse(BaseModel):
     viewed: bool
     e2e: bool
     client_id: Optional[str] = None
+    # --- Этап 7.3: Статусы сообщений (sent -> delivered -> read) ---
+    status: str = "sent"
+    delivered_at: Optional[object] = None
+    read_at: Optional[object] = None
     # v2.0 Пункт 2: абсолютный момент физической смерти сообщения (tz-aware UTC).
     # Клиент использует его для локального таймера автоудаления карточки —
     # даже если WS-событие message_delete потерялось (обход прокси и т.п.).
@@ -133,6 +139,13 @@ def _serialize_msg(m: dict) -> MessageResponse:
         viewed=bool(m["viewed"]),
         e2e=bool(m.get("e2e")),
         client_id=m.get("client_id"),
+        # Этап 7.3: легаси-строки до миграции b7c3d9e1f2a4 имеют status=NULL —
+        # наружу отдаём консервативное «sent» (нижняя граница шкалы).
+        status=(m.get("status") or MessageStatus.sent.value)
+        if isinstance(m.get("status"), (str, type(None)))
+        else str(m["status"]),
+        delivered_at=m.get("delivered_at"),
+        read_at=m.get("read_at"),
         expires_at=m.get("expires_at"),
         created_at=m["created_at"],
     )
@@ -413,6 +426,142 @@ async def mark_viewed(message_id: int, user: dict = Depends(get_current_user)):
             {"type": "message_delete", "chat_id": m["chat_id"], "message_ids": [message_id]},
         )
     return {"ok": True}
+
+
+class UpdateStatusRequest(BaseModel):
+    """Тело PATCH /messages/{id}/status (Этап 7.3).
+
+    ghost=True — клиентский флаг «призрачного чтения»: сервер применит
+    статус не выше delivered (см. _ghost_read_enabled). Флаг является
+    дополнением к серверной настройке пользователя: любой из источников
+    включает privacy-режим.
+    """
+
+    status: str = Field(pattern="^(delivered|read)$")
+    ghost: bool = Field(
+        default=False,
+        description="Не показывать собеседнику синие галочки (read -> delivered)",
+    )
+
+
+# SQL-выражение числового ранга статуса (Этап 7.3). Диалект-безопасно:
+# стандартный searched CASE исполняется и SQLite, и PostgreSQL 16.
+# Ранги задаются ЯВНО (_STATUS_ORDER/status_rank в models_base.py), потому
+# что лексикографический порядок строк НЕ совпадает с жизненным циклом:
+# 'delivered' < 'read' < 'sent' — наивное сравнение статусов как строк
+# сделало бы базовый 'sent' «больше» всех и сломало переход sent->delivered.
+_STATUS_RANK_CASE = "(CASE COALESCE(status, 'sent') " \
+                    "WHEN 'sent' THEN 0 WHEN 'delivered' THEN 1 ELSE 2 END)"
+
+
+async def _ghost_read_enabled(db, user_id: int) -> bool:
+    """Серверная настройка Ghost Mode пользователя (privacy-first).
+
+    Хранится в KV-таблице settings под ключом `ghost_read:{user_id}`
+    (anyio-совместимое чтение без кеша: редкий путь, только для read).
+    Значения '1'/'true' — включено; отсутствие записи — выключено.
+    """
+    row = await database.aq1(
+        db, "SELECT value FROM settings WHERE key=:k", {"k": f"ghost_read:{user_id}"}
+    )
+    return bool(row) and (row["value"] or "").strip().lower() in ("1", "true", "on", "yes")
+
+
+@router.patch("/messages/{message_id}/status")
+async def update_message_status(
+    message_id: int,
+    body: UpdateStatusRequest,
+    user: dict = Depends(get_current_user),
+):
+    """Перевод сообщения в статус delivered/read — идемпотентно и атомарно.
+
+    Защита от состояния гонки (read раньше delivered из-за лагов сети)
+    строится на одном условном UPDATE «compare-and-set» по ЧИСЛОВОМУ
+    рангу статуса, который БД вычисляет на лету через CASE:
+
+        UPDATE messages SET ... WHERE id=:id
+          AND (CASE status ... END) < :new_rank   -- ранги: sent=0, deliv=1, read=2
+
+    - Переход возможен ТОЛЬКО вперёд по шкале рангов: запоздалый
+      «delivered» (rank 1), прилетевший когда в базе уже «read» (rank 2),
+      не удовлетворяет условию 2 < 1 => rowcount=0 => тихий no-op (200 OK,
+      changed=False), никакого 500 и никакого отката статуса назад.
+    - Идемпотентность повторов: второй «read» при «read» => rowcount=0.
+    - Окна между проверкой и записью нет: сравнение и запись выполняются
+      одним оператором под row-level lock (PG) / write-lock (SQLite WAL).
+    - Ghost Mode: если у читателя включена настройка `ghost_read:{uid}`
+      (или клиент прислал ghost=True), целевой статус понижается до
+      delivered — «read» в базу не попадает, ответ остаётся 200 OK.
+    - WS-событие отправляется только при changed=True и ПОСЛЕ commit
+      (паттерн send_message): подписчик не увидит событие о строке,
+      которую параллельно удалил janitor.
+    """
+    async with database.get_db() as db:
+        m = await database.aq1(
+            db,
+            "SELECT chat_id, sender_id, expires_at FROM messages WHERE id=:id",
+            {"id": message_id},
+        )
+        if not m:
+            raise HTTPException(404, "Сообщение не найдено")
+        # Сгорающее сообщение физически мертво — статусы не принимаем
+        # (то же окно видимости = 0, что и в mark_viewed).
+        if _schema_has_expires_at() and m.get("expires_at") is not None \
+                and as_utc(m["expires_at"]) <= utc_now():
+            raise HTTPException(404, "Сообщение не найдено")
+        if not await is_chat_member(m["chat_id"], user["id"]):
+            raise HTTPException(403, "Нет доступа")
+        # Отправляющему нельзя «читать» собственные сообщения — иначе он
+        # сам себе выставил бы синие галочки.
+        if m["sender_id"] == user["id"]:
+            raise HTTPException(403, "Нельзя менять статус своего сообщения")
+
+        now = utc_now()
+        target = MessageStatus(body.status)
+        # --- Ghost Mode: read превращаем в delivered (тихий 200 OK) ---
+        if target is MessageStatus.read and (
+            body.ghost or await _ghost_read_enabled(db, user["id"])
+        ):
+            target = MessageStatus.delivered
+
+        if target is MessageStatus.delivered:
+            set_clause = "status = :new_status, delivered_at = :now"
+        else:  # read: доставляем и прочитанность, и доставленность разом
+            set_clause = (
+                "status = :new_status, delivered_at = COALESCE(delivered_at, :now), "
+                "read_at = :now"
+            )
+        result = await db.execute(
+            sql_text(
+                f"UPDATE messages SET {set_clause} "  # noqa: B907 — константа модуля
+                f"WHERE id = :id AND {_STATUS_RANK_CASE} < :new_rank"
+            ),
+            {
+                "id": message_id,
+                "new_status": target.value,
+                "new_rank": status_rank(target),
+                "now": now,
+            },
+        )
+        changed = result.rowcount > 0
+        current = await database.aq1(
+            db, "SELECT status FROM messages WHERE id=:id", {"id": message_id}
+        )
+
+    final_status = (current or {}).get("status") or MessageStatus.sent.value
+    if changed:
+        # WS — вне транзакции (после commit): событие видит только записанное.
+        await manager.send_to_user(
+            m["sender_id"],
+            {
+                "type": "message_status",
+                "message_id": message_id,
+                "chat_id": m["chat_id"],
+                "status": final_status,
+                "reader_id": user["id"],
+            },
+        )
+    return {"ok": True, "changed": changed, "status": final_status}
 
 
 @router.delete("/messages/{message_id}")

@@ -12,6 +12,8 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional
 
+import flet as ft
+
 # ---------------------------------------------------------------------------
 # Константы
 # ---------------------------------------------------------------------------
@@ -67,6 +69,54 @@ STATUS_GLYPH: dict[MessageStatus, str] = {
     MessageStatus.FAILED: "⚠",
 }
 
+# ---------------------------------------------------------------------------
+# «Живая галочка» (Этап 7.3, Спринт 3): маппинг статуса -> Material-иконка
+# ---------------------------------------------------------------------------
+
+#: Линейный жизненный цикл статусов сервера (отправленное в прошлое поле).
+_STATUS_FLOW: tuple[MessageStatus, ...] = (
+    MessageStatus.SENT,
+    MessageStatus.DELIVERED,
+    MessageStatus.READ,
+)
+
+
+def status_icon(status: MessageStatus) -> str:
+    """Чистая изолированная функция: MessageStatus -> имя иконки ft.Icons.
+
+    sent -> CHECK (одна серая галочка);
+    delivered/read -> DONE_ALL (две галочки; цвет задаёт status_icon_color).
+    Локальные pre/post-состояния клиента (sending/failed) сохраняют свою
+    семантику: 🕓/⚠ рисуются через STATUS_GLYPH, для иконок — часы и ошибка.
+    """
+    return {
+        # SCHEDULE_OUTLINED (часы) — в installed Flet нет CLOCK_OUTLINED;
+        # семантика «в очереди на отправку» сохраняется.
+        MessageStatus.SENDING: ft.Icons.SCHEDULE_OUTLINED,
+        MessageStatus.SENT: ft.Icons.CHECK,
+        MessageStatus.DELIVERED: ft.Icons.DONE_ALL,
+        MessageStatus.READ: ft.Icons.DONE_ALL,
+        MessageStatus.FAILED: ft.Icons.ERROR_OUTLINE,
+    }[status]
+
+
+def status_icon_color(status: MessageStatus, sub_color: str, read_color: str) -> str:
+    """Цвет галочки: read — акцентный синий, всё остальное — приглушённый."""
+    return read_color if status is MessageStatus.READ else sub_color
+
+
+def next_status(current: MessageStatus, incoming: MessageStatus) -> MessageStatus:
+    """Монотонный merge двух статусов: побеждает более поздний по циклу.
+
+    События WS могут прилетать в произвольном порядке (лаги сети), поэтому
+    клиентский статус никогда не откатывается назад: sent(0)->delivered(1)->
+    read(2). Локальные состояния SENDING/FAILED вне цикла — возвращаем их
+    как есть, если ни один из статусов не принадлежит потоку.
+    """
+    cur_rank = _STATUS_FLOW.index(current) if current in _STATUS_FLOW else -1
+    inc_rank = _STATUS_FLOW.index(incoming) if incoming in _STATUS_FLOW else -1
+    return incoming if inc_rank > cur_rank else current
+
 
 @dataclass
 class Message:
@@ -88,6 +138,10 @@ class Message:
     reply_preview: Optional[str] = None
     read_by: set[int] = field(default_factory=set)
     failed: bool = False
+    # Этап 7.3 «Живая галочка»: back-link на отрисованный MessageRow
+    # (исключительно для O(1)-замены строки черновика при подтверждении;
+    # repr/eq по умолчанию не трогаем — поле compare=False).
+    _row: object = field(default=None, repr=False, compare=False)
 
     @classmethod
     def from_server(cls, raw: dict, my_id: int) -> "Message":

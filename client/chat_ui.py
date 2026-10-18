@@ -27,6 +27,9 @@ from ui.message_model import (
     STATUS_GLYPH,
     Message,
     MessageStatus,
+    next_status,
+    status_icon,
+    status_icon_color,
 )
 from ui.message_area import (
     ChatScreen,
@@ -55,6 +58,9 @@ __all__ = [
     "STATUS_GLYPH",
     "MAX_EDIT_WINDOW_SECONDS",
     "SAFETY_NUMBER_GROUPS",
+    "status_icon",
+    "status_icon_color",
+    "next_status",
 ]
 
 
