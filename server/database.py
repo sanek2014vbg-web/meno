@@ -12,6 +12,7 @@ Alembic в migrations/env.py, тесты) работал без единой п�
 
 Новый код обязан импортировать конкретные модули пакета `server.db`, а не фасад.
 """
+
 from sqlalchemy import text  # noqa: F401 (реэкспорт для совместимости auth/routes)
 
 from server.config import DATABASE_URL, IS_SQLITE  # noqa: F401 (совместимость фасада)
@@ -23,6 +24,7 @@ from server.db.models_base import (
     Message,
     PushOutbox,
     PushToken,
+    Reaction,
     RefreshToken,
     Report,
     SecurityEvent,
@@ -50,6 +52,7 @@ __all__ = [
     "Message",
     "PushOutbox",
     "PushToken",
+    "Reaction",
     "RefreshToken",
     "Report",
     "SecurityEvent",

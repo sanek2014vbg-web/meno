@@ -4,6 +4,7 @@ Loguru для структурированного вывода; Sentry — по
 (Этап 3.4 ТЗ): если MENO_SENTRY_DSN не задан, мониторинг ошибок просто
 не инициализируется, сервер работает автономно.
 """
+
 import os
 import sys
 
@@ -38,7 +39,9 @@ def setup_logging() -> None:
 def setup_sentry() -> bool:
     """Инициализация Sentry для мониторинга ошибок. Возвращает True, если включён."""
     if not SENTRY_DSN:
-        logger.info("SENTRY_DSN is not configured — Sentry monitoring disabled (self-hosted mode).")
+        logger.info(
+            "SENTRY_DSN is not configured — Sentry monitoring disabled (self-hosted mode)."
+        )
         return False
 
     import sentry_sdk

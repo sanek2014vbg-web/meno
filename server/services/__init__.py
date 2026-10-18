@@ -3,6 +3,7 @@
 typing: индикатор «Печатает...» с нулевой нагрузкой на PostgreSQL
 (SETEX typing:{chat}:{user} 6 + fan-out через Redis Pub/Sub канал meno:ws).
 """
+
 from server.services.typing import (
     STOP_SENTINELS,
     TYPING_CHANNEL,

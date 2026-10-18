@@ -8,6 +8,7 @@
   (Этап 4.1 ТЗ), порог считается на Python, поэтому запросы работают и на
   PostgreSQL, и на SQLite.
 """
+
 import logging
 from contextlib import asynccontextmanager
 from datetime import timedelta
@@ -43,9 +44,21 @@ async def init_db() -> None:
 
     Используется в lifespan-старте при SQLite-профиле и в фикстурах pytest;
     в prod на PostgreSQL схема принадлежит Alembic (`alembic upgrade head`).
+
+    Дефект-фикс «Right-Size the Truth» (Этап 8): для существующих легаси-БД,
+    созданных до Этапа 7.3, дополнительно выполняется диалект-безопасный
+    lightweight-upgrade колонок/индексов messages.reactions_summary,
+    messages.reply_to_id и таблицы reactions (см. server/db/schema_compat.py).
+    create_all сам по себе идемпотентен только для НОВЫХ таблиц — новые
+    колонки в существующей таблице он не добавляет, поэтому без этого шага
+    сервер падал бы с 'no such column: reactions_summary' на любой БД,
+    мигрированной до 7.3.
     """
+    from server.db.schema_compat import ensure_reactions_schema
+
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(ensure_reactions_schema)
     logger.info(
         "Database schema initialized (%s).", "SQLite" if IS_SQLITE else "PostgreSQL"
     )

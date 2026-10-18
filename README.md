@@ -114,25 +114,48 @@ pip install pre-commit && pre-commit install
 ## Структура репозитория
 
 ```
-server/            FastAPI backend (app/ — единый пакет, tests/ — pytest-asyncio)
+server/            FastAPI backend (routes_*.py, services/, db/, ws_manager.py)
   Dockerfile       multi-stage production-образ (python:3.11-slim, non-root)
   entrypoint.sh    alembic upgrade head → uvicorn
 client/            Flet UI (auth_storage.py, chat_ui.py, screens/)
+tests/             unit/ + integration/ (pytest-asyncio, PG16/SQLite матрица)
 migrations/        Alembic (один head, включая FTS 'russian' и security_events)
-deploy/            setup_vps.sh, RUNBOOK.md
+deploy/            setup_vps.sh, meno.service
 .github/workflows/ ci.yml — gitleaks, ruff, pytest(PG+Redis), coverage≥70%, docker build
-docs/              CHANGELOG.md
 SECURITY.md        политика уязвимостей + процедура ротации секретов
+CONTRIBUTING.md    setup, проверки перед PR, Golden Rules («No direct changes to main»)
+CODE_OF_CONDUCT.md Contributor Covenant v2.1
 docker-compose.yml self-hosted стек: app + postgres + redis + minio
 ```
 
 ## Безопасность
 
 - Сообщения об уязвимостях — см. [SECURITY.md](SECURITY.md).
-- Секретов в git нет и быть не может: `.gitignore` + pre-commit gitleaks + CI-скан.
-- История репозитория очищена `git filter-repo`; все ранее попадавшие в историю
-  ключи **ротированы** (процедура — раздел «Аварийная ротация» в SECURITY.md).
-- Ветки `main` защищены: обязательный зелёный CI, CODEOWNERS, no force-push.
+- Fail-Fast конфигурации (`server/config.py`): в продакшене сервер **отказывается
+  стартовать** без уникального `MENO_JWT_SECRET`; для локальной разработки —
+  явный флаг `MENO_DEV_ENV=1`.
+- Секретов в git нет: `.env` выведен из индекса и в `.gitignore`, CI-скан
+  gitleaks блокирует попадание ключей в историю. Локальный pre-commit включает
+  ruff/ruff-format/hygiene-хуки; gitleaks исполняется в CI (локальный хук —
+  TODO-трекер в CONTRIBUTING, не утверждается как факт).
+- Ветки `main` защищены: обязательный зелёный CI, no force-push.
+
+## Оптимизации бэкенда (Этап 7.3 / v1.0.0)
+
+- **Batch-load реакций против N+1.** История сообщений обогащается сводкой
+  реакций ОДНИМ запросом `IN (:ids)` (expanding bindparam) с O(1)-агрегацией в
+  Python-словарь (`load_reactions_batch`, `server/routes_reactions.py`) — вместо
+  SELECT на каждое сообщение списка.
+- **Денормализация `reactions_summary`.** Готовая JSON-сводка хранится в
+  таблице `messages` и пересобирается атомарно в той же транзакции toggle-роута
+  — чтение ленты не касается таблицы `reactions` вовсе.
+- **Application-level каскады.** DELETE-роуты явно чистят зависимости
+  (`reply_to_id=NULL`, `DELETE FROM reactions WHERE message_id=:id`) до удаления
+  строки сообщения — защита от FK-«сирот» на SQLite, где прагма FK не всегда
+  включена.
+- **`schema_compat.py`.** Диалект-безопасная рантайм-ревизия схемы через
+  `sa.inspect()`: самодельные SQLite-инсталляции и тестовые БД, созданные до
+  Этапа 7.3, догоняют схему на лету (PG прод мигрируется Alembic).
 
 ## Roadmap клиента (Этап 7)
 

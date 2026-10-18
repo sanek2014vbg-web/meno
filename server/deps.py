@@ -1,4 +1,5 @@
 """MeNo — общие зависимости FastAPI для маршрутов."""
+
 from fastapi import Header, HTTPException
 
 from server import auth, database
@@ -9,7 +10,7 @@ async def get_current_user(authorization: str = Header(default="")) -> dict:
     """Извлекает пользователя из Bearer-токена (асинхронно)."""
     if not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Требуется авторизация")
-    token = authorization[len("Bearer "):]
+    token = authorization[len("Bearer ") :]
     user_id = auth.decode_token(token)
     user = await auth.get_user_by_id(user_id) if user_id is not None else None
     if user is None:

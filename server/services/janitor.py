@@ -34,6 +34,7 @@ Flet удаляет карточку только если она ещё при�
 - отмена задачи (shutdown приложения) корректно завершает цикл через
   asyncio.CancelledError.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -81,11 +82,12 @@ async def _schema_has_expires_at(db) -> bool:
             _SCHEMA_EXPIRES_AT = True
     return _SCHEMA_EXPIRES_AT
 
+
 # --- Протокольные константы --------------------------------------------------
-JANITOR_INTERVAL_SECONDS = 10      # период тика по ТЗ v2.0 Пункт 2
-JANITOR_SCAN_LIMIT = 2000          # максимум строк за один скан (защита от
-                                   # длинных хвостов после простоя сервера)
-JANITOR_DELETE_CHUNK = 500         # размер чанка DELETE ... WHERE id IN (...)
+JANITOR_INTERVAL_SECONDS = 10  # период тика по ТЗ v2.0 Пункт 2
+JANITOR_SCAN_LIMIT = 2000  # максимум строк за один скан (защита от
+# длинных хвостов после простоя сервера)
+JANITOR_DELETE_CHUNK = 500  # размер чанка DELETE ... WHERE id IN (...)
 DELETE_EVENT_TYPE = "message_delete"  # имя WS-события (совпадает с клиентом)
 
 
@@ -125,8 +127,7 @@ class JanitorService:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 — дворник не роняет сервер
-                log.error("Janitor tick failed: %s: %s",
-                          exc.__class__.__name__, exc)
+                log.error("Janitor tick failed: %s: %s", exc.__class__.__name__, exc)
             await asyncio.sleep(interval)
 
     # ------------------------------------------------------------------ #
@@ -159,14 +160,16 @@ class JanitorService:
                 dead = False
                 exp = as_utc(r["expires_at"]) if has_abs else None
                 if exp is not None and exp <= now:
-                    dead = True                      # абсолютный TTL v2.0
+                    dead = True  # абсолютный TTL v2.0
                 elif r["view_once"] and r["viewed"]:
-                    dead = True                      # просмотрено однократное
+                    dead = True  # просмотрено однократное
                 elif r["ttl_seconds"] is not None:
                     created = as_utc(r["created_at"])
-                    if created is not None and \
-                            created + timedelta(seconds=int(r["ttl_seconds"])) <= now:
-                        dead = True                  # legacy относительный TTL
+                    if (
+                        created is not None
+                        and created + timedelta(seconds=int(r["ttl_seconds"])) <= now
+                    ):
+                        dead = True  # legacy относительный TTL
                 if dead:
                     expired.append({"id": r["id"], "chat_id": r["chat_id"]})
 
@@ -184,7 +187,7 @@ class JanitorService:
             # Физическое удаление (не soft-delete): контент исчезает из БД.
             # Чанкуем, чтобы не строить SQL на тысячи плейсхолдеров за раз.
             for start in range(0, len(ids), JANITOR_DELETE_CHUNK):
-                chunk = ids[start:start + JANITOR_DELETE_CHUNK]
+                chunk = ids[start : start + JANITOR_DELETE_CHUNK]
                 placeholders = ",".join(f":m{i}" for i in range(len(chunk)))
                 params = {f"m{i}": mid for i, mid in enumerate(chunk)}
                 await db.execute(
@@ -215,13 +218,18 @@ class JanitorService:
             # либо локальная доставка (single worker / без Redis).
             await manager.send_to_users(member_ids, payload)
 
-        log.info("Janitor erased %s message(s) across %s chat(s)",
-                 len(ids), len(by_chat))
+        log.info(
+            "Janitor erased %s message(s) across %s chat(s)", len(ids), len(by_chat)
+        )
         self._tick_count += 1
         return len(ids)
 
 
 janitor_service = JanitorService()
 
-__all__ = ["JanitorService", "janitor_service",
-           "JANITOR_INTERVAL_SECONDS", "DELETE_EVENT_TYPE"]
+__all__ = [
+    "JanitorService",
+    "janitor_service",
+    "JANITOR_INTERVAL_SECONDS",
+    "DELETE_EVENT_TYPE",
+]

@@ -15,6 +15,7 @@
 Инструмент идемпотентен: повторный запуск --repair при единственном head
 ничего не делает и завершается успешно.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -85,7 +86,10 @@ def cmd_repair() -> int:
         print(f"OK: единственный head {heads[0]}, ремонт не требуется.")
         return 0
     if not heads:
-        print("ERROR: не найдено ни одной ревизии — проверьте migrations/.", file=sys.stderr)
+        print(
+            "ERROR: не найдено ни одной ревизии — проверьте migrations/.",
+            file=sys.stderr,
+        )
         return 2
 
     from datetime import datetime, timezone
@@ -97,14 +101,16 @@ def cmd_repair() -> int:
         msg=f"{' + '.join(heads)}",
         rev=rev,
         revs=", ".join(heads),
-        revs_tuple=", ".join(f"'{h}'" for h in heads) + ("," if len(heads) == 1 else ""),
+        revs_tuple=", ".join(f"'{h}'" for h in heads)
+        + ("," if len(heads) == 1 else ""),
         date=datetime.now(timezone.utc).isoformat(timespec="seconds"),
     )
     filename.write_text(body, encoding="utf-8")
     new_heads = get_heads()
     if len(new_heads) != 1:
         print(
-            f"ERROR: после ремонта heads всё ещё {new_heads}", file=sys.stderr,
+            f"ERROR: после ремонта heads всё ещё {new_heads}",
+            file=sys.stderr,
         )
         return 3
     print(f"Created merge revision {rev} -> single head confirmed: {new_heads[0]}")
@@ -114,10 +120,16 @@ def cmd_repair() -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--check", action="store_true",
-                       help="проверить количество heads (exit 1 если > 1)")
-    group.add_argument("--repair", action="store_true",
-                       help="сгенерировать merge-revision при нескольких heads")
+    group.add_argument(
+        "--check",
+        action="store_true",
+        help="проверить количество heads (exit 1 если > 1)",
+    )
+    group.add_argument(
+        "--repair",
+        action="store_true",
+        help="сгенерировать merge-revision при нескольких heads",
+    )
     args = parser.parse_args(argv)
     return cmd_repair() if args.repair else cmd_check()
 

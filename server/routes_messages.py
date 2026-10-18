@@ -9,6 +9,7 @@
   to_tsvector('russian'), на SQLite — переносимый LIKE (Этап 4.2);
 - антиспам-лимит по окну времени (tz-aware UTC).
 """
+
 from datetime import timedelta
 from typing import List, Optional
 
@@ -17,7 +18,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import text as sql_text
 from sqlalchemy.exc import IntegrityError
 
-from server import auth, config, database, push as push_service
+from server import config, database, push as push_service
 from server.db.connection import engine
 from server.deps import get_current_user, is_chat_member
 from server.rate_limit import user_key, limiter
@@ -61,12 +62,16 @@ class SendMessageRequest(BaseModel):
     type: str = Field(default="text", pattern="^(text|image|file|voice|emoji)$")
     content: str = Field(default="", max_length=4000)
     media_path: str = Field(default="")
-    duration: Optional[int] = Field(default=0, description="Длительность аудио в секундах")
+    duration: Optional[int] = Field(
+        default=0, description="Длительность аудио в секундах"
+    )
     ttl_seconds: Optional[int] = Field(default=None, ge=5, le=86400 * 7)
     view_once: bool = False
     e2e: bool = False
     client_id: Optional[str] = Field(
-        default=None, min_length=8, max_length=64,
+        default=None,
+        min_length=8,
+        max_length=64,
         description="Идемпотентный ключ клиента: повторная отправка не создаст дубликат",
     )
 
@@ -118,6 +123,18 @@ def _live_params(now, now_text: str) -> dict:
     return {"now": now, "now_text": now_text}
 
 
+def _iso_utc(dt) -> str | None:
+    """datetime/ISO-строка из БД → канонический ISO-8601 UTC (или None).
+
+    Дефект-фикс v1.0.0 (WS fan-out тест): колонки created_at/expires_at на
+    SQLite возвращаются драйвером как datetime или TEXT в зависимости от пути
+    записи. Нормализация ДО публикации гарантирует одинаковый wire-формат
+    payload для PostgreSQL и SQLite — потребители WS видят только строку.
+    """
+    parsed = as_utc(dt)
+    return parsed.isoformat() if parsed is not None else None
+
+
 def _serialize_msg(m: dict) -> MessageResponse:
     return MessageResponse(
         id=m["id"],
@@ -133,8 +150,8 @@ def _serialize_msg(m: dict) -> MessageResponse:
         viewed=bool(m["viewed"]),
         e2e=bool(m.get("e2e")),
         client_id=m.get("client_id"),
-        expires_at=m.get("expires_at"),
-        created_at=m["created_at"],
+        expires_at=_iso_utc(m.get("expires_at")),
+        created_at=_iso_utc(m["created_at"]) or "",
     )
 
 
@@ -204,8 +221,9 @@ async def search_messages(
             where = "LOWER(m.content) LIKE LOWER(:q)"
             params = {"chat_id": chat_id, "q": f"%{q_clean}%"}
         else:
-            where = ("to_tsvector('russian', m.content) "
-                     "@@ plainto_tsquery('russian', :q)")
+            where = (
+                "to_tsvector('russian', m.content) @@ plainto_tsquery('russian', :q)"
+            )
             params = {"chat_id": chat_id, "q": q_clean}
 
         now = utc_now()
@@ -280,29 +298,45 @@ async def send_message(
         # при expires_at=None получалось 12 плейсхолдеров на 11 колонок.
         # Ключи params теперь строго соответствуют колонкам + ":name"-плейсхолдерам.
         insert_params = {
-                    "chat_id": chat_id,
-                    "sender_id": user["id"],
-                    "type": body.type,
-                    "content": body.content.strip(),
-                    "media_path": body.media_path,
-                    "duration": body.duration or 0,
-                    "ttl_seconds": body.ttl_seconds,
-                    "view_once": 1 if body.view_once else 0,
-                    "e2e": 1 if body.e2e else 0,
-                    "client_id": body.client_id,
-                    "created_at": now,
-                }
+            "chat_id": chat_id,
+            "sender_id": user["id"],
+            "type": body.type,
+            "content": body.content.strip(),
+            "media_path": body.media_path,
+            "duration": body.duration or 0,
+            "ttl_seconds": body.ttl_seconds,
+            "view_once": 1 if body.view_once else 0,
+            "e2e": 1 if body.e2e else 0,
+            "client_id": body.client_id,
+            "created_at": now,
+        }
         if expires_at is not None and _schema_has_expires_at():
             # v2.0 Пункт 2: абсолютный дедлайн физической смерти сообщения.
             insert_sql += ", expires_at"
             insert_params["expires_at"] = expires_at
-        insert_sql += ") VALUES (" + ", ".join(
-            f":{k}" for k in (
-                ["chat_id", "sender_id", "type", "content", "media_path", "duration",
-                 "ttl_seconds", "view_once", "e2e", "client_id", "created_at"]
-                + (["expires_at"] if "expires_at" in insert_params else [])
+        insert_sql += (
+            ") VALUES ("
+            + ", ".join(
+                f":{k}"
+                for k in (
+                    [
+                        "chat_id",
+                        "sender_id",
+                        "type",
+                        "content",
+                        "media_path",
+                        "duration",
+                        "ttl_seconds",
+                        "view_once",
+                        "e2e",
+                        "client_id",
+                        "created_at",
+                    ]
+                    + (["expires_at"] if "expires_at" in insert_params else [])
+                )
             )
-        ) + ")"
+            + ")"
+        )
         try:
             await db.execute(sql_text(insert_sql), insert_params)
         except IntegrityError:
@@ -322,7 +356,8 @@ async def send_message(
             raise
 
         msg_id_row = await db.execute(
-            sql_text("SELECT MAX(id) AS mid FROM messages WHERE chat_id=:cid"), {"cid": chat_id}
+            sql_text("SELECT MAX(id) AS mid FROM messages WHERE chat_id=:cid"),
+            {"cid": chat_id},
         )
         mid = msg_id_row.scalar()
         if mid is None:
@@ -338,9 +373,14 @@ async def send_message(
             "JOIN users u ON u.id = m.sender_id WHERE m.id=:id",
             {"id": mid},
         )
-        members = [r["user_id"] for r in await database.aq(
-            db, "SELECT user_id FROM chat_members WHERE chat_id=:cid", {"cid": chat_id}
-        )]
+        members = [
+            r["user_id"]
+            for r in await database.aq(
+                db,
+                "SELECT user_id FROM chat_members WHERE chat_id=:cid",
+                {"cid": chat_id},
+            )
+        ]
         sender_label = msg["sender_name"]
 
     payload = {"type": "new_message", "message": _serialize_msg(msg)}
@@ -365,11 +405,14 @@ async def send_message(
                 else:
                     push_body = (body.content or "")[:120]
                 await push_service.send_to_user(
-                    uid, sender_label, push_body,
+                    uid,
+                    sender_label,
+                    push_body,
                     {"chat_id": str(chat_id), "message_id": str(msg["id"])},
                 )
     except Exception as exc:  # noqa: BLE001 — push не должен ронять отправку
         from loguru import logger
+
         logger.warning("Push delivery failed: {}", exc.__class__.__name__)
 
     return payload["message"]
@@ -385,32 +428,53 @@ async def push_poll(user: dict = Depends(get_current_user)):
 @router.post("/messages/{message_id}/view")
 async def mark_viewed(message_id: int, user: dict = Depends(get_current_user)):
     async with database.get_db() as db:
-        m = await database.aq1(db, "SELECT * FROM messages WHERE id=:id", {"id": message_id})
+        m = await database.aq1(
+            db, "SELECT * FROM messages WHERE id=:id", {"id": message_id}
+        )
         if not m:
             raise HTTPException(404, "Сообщение не найдено")
         # v2.0 Пункт 2: истёкшее по TTL сообщение уже физически мертво —
         # не отдаём его контент и не шлём статус прочтения, не дожидаясь
         # следующего тика janitor'а (окно видимости = 0).
-        if _schema_has_expires_at() and m.get("expires_at") is not None \
-                and as_utc(m["expires_at"]) <= utc_now():
+        if (
+            _schema_has_expires_at()
+            and m.get("expires_at") is not None
+            and as_utc(m["expires_at"]) <= utc_now()
+        ):
             raise HTTPException(404, "Сообщение не найдено")
         if not await is_chat_member(m["chat_id"], user["id"]):
             raise HTTPException(403, "Нет доступа")
         was_unseen_view_once = bool(m["view_once"]) and not m["viewed"]
         if was_unseen_view_once:
-            await db.execute(sql_text("UPDATE messages SET viewed=1 WHERE id=:id"), {"id": message_id})
+            await db.execute(
+                sql_text("UPDATE messages SET viewed=1 WHERE id=:id"),
+                {"id": message_id},
+            )
 
-    payload = {"type": "message_viewed", "message_id": message_id, "chat_id": m["chat_id"]}
+    payload = {
+        "type": "message_viewed",
+        "message_id": message_id,
+        "chat_id": m["chat_id"],
+    }
     await manager.send_to_user(m["sender_id"], payload)
 
     if was_unseen_view_once:
         async with database.get_db() as db:
-            members = [r["user_id"] for r in await database.aq(
-                db, "SELECT user_id FROM chat_members WHERE chat_id=:cid", {"cid": m["chat_id"]}
-            )]
+            members = [
+                r["user_id"]
+                for r in await database.aq(
+                    db,
+                    "SELECT user_id FROM chat_members WHERE chat_id=:cid",
+                    {"cid": m["chat_id"]},
+                )
+            ]
         await manager.send_to_users(
             members,
-            {"type": "message_delete", "chat_id": m["chat_id"], "message_ids": [message_id]},
+            {
+                "type": "message_delete",
+                "chat_id": m["chat_id"],
+                "message_ids": [message_id],
+            },
         )
     return {"ok": True}
 
@@ -418,18 +482,28 @@ async def mark_viewed(message_id: int, user: dict = Depends(get_current_user)):
 @router.delete("/messages/{message_id}")
 async def delete_message(message_id: int, user: dict = Depends(get_current_user)):
     async with database.get_db() as db:
-        m = await database.aq1(db, "SELECT * FROM messages WHERE id=:id", {"id": message_id})
+        m = await database.aq1(
+            db, "SELECT * FROM messages WHERE id=:id", {"id": message_id}
+        )
         if not m:
             raise HTTPException(404, "Сообщение не найдено")
         if m["sender_id"] != user["id"]:
             raise HTTPException(403, "Удалять можно только свои сообщения")
-        await db.execute(sql_text("DELETE FROM messages WHERE id=:id"), {"id": message_id})
-        members = [r["user_id"] for r in await database.aq(
-            db, "SELECT user_id FROM chat_members WHERE chat_id=:cid", {"cid": m["chat_id"]}
-        )]
+        await db.execute(
+            sql_text("DELETE FROM messages WHERE id=:id"), {"id": message_id}
+        )
+        members = [
+            r["user_id"]
+            for r in await database.aq(
+                db,
+                "SELECT user_id FROM chat_members WHERE chat_id=:cid",
+                {"cid": m["chat_id"]},
+            )
+        ]
 
     await manager.send_to_users(
-        members, {"type": "message_deleted", "message_id": message_id, "chat_id": m["chat_id"]}
+        members,
+        {"type": "message_deleted", "message_id": message_id, "chat_id": m["chat_id"]},
     )
     return {"ok": True}
 
@@ -442,7 +516,9 @@ class ReportRequest(BaseModel):
 @router.post("/reports")
 async def report_message(body: ReportRequest, user: dict = Depends(get_current_user)):
     async with database.get_db() as db:
-        m = await database.aq1(db, "SELECT * FROM messages WHERE id=:id", {"id": body.message_id})
+        m = await database.aq1(
+            db, "SELECT * FROM messages WHERE id=:id", {"id": body.message_id}
+        )
         if not m:
             raise HTTPException(404, "Сообщение не найдено")
         if not await is_chat_member(m["chat_id"], user["id"]):
@@ -457,8 +533,15 @@ async def report_message(body: ReportRequest, user: dict = Depends(get_current_u
         if already:
             raise HTTPException(400, "Вы уже пожаловались на это сообщение")
         await db.execute(
-            sql_text("INSERT INTO reports (chat_id, message_id, reporter_id, reason) "
-                     "VALUES (:cid, :mid, :uid, :reason)"),
-            {"cid": m["chat_id"], "mid": m["id"], "uid": user["id"], "reason": body.reason.strip()},
+            sql_text(
+                "INSERT INTO reports (chat_id, message_id, reporter_id, reason) "
+                "VALUES (:cid, :mid, :uid, :reason)"
+            ),
+            {
+                "cid": m["chat_id"],
+                "mid": m["id"],
+                "uid": user["id"],
+                "reason": body.reason.strip(),
+            },
         )
     return {"ok": True, "message": "Жалоба отправлена модератору"}

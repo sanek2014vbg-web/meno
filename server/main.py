@@ -14,7 +14,7 @@
     MENO_UPLOAD_DIR       — каталог загруженных файлов
     MENO_S3_*             — профиль S3/MinIO (опционально)
 """
-import asyncio
+
 import logging
 import time
 from contextlib import asynccontextmanager
@@ -23,7 +23,6 @@ from typing import Optional
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 
 from server import auth, config, database
 from server.cache import cache
@@ -33,6 +32,7 @@ from server.routes_auth import router as auth_router
 from server.routes_chats import router as chats_router
 from server.routes_files import router as files_router
 from server.routes_messages import router as messages_router
+from server.routes_reactions import router as reactions_router
 from server.ws_manager import manager
 
 setup_logging()
@@ -70,8 +70,18 @@ async def lifespan(app: FastAPI):
 
     await janitor_service.start()
 
+    # Дефект-фикс v1.0.0 (зависание test_ws_endpoint_delivers_typing):
+    # при включённом Redis cache fan-out user_typing/new_message идёт через
+    # канал meno:ws, но подписчик (_bus_loop) нигде не запускался — событие
+    # публиковалось в пустоту и получатель ждал вечно. В проде это же чинило
+    # бы multi-worker доставку на единственном воркере. Идемпотентно.
+    from server.ws_manager import manager as ws_manager
+
+    await ws_manager.start_bus_listener()
+
     yield
 
+    await ws_manager.stop_bus_listener()
     await janitor_service.stop()
     await cache.close()
 
@@ -142,7 +152,9 @@ async def security_headers(request: Request, call_next):
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "no-referrer"
-    response.headers["Permissions-Policy"] = "camera=(), microphone=(self), geolocation=()"
+    response.headers["Permissions-Policy"] = (
+        "camera=(), microphone=(self), geolocation=()"
+    )
     # CSP: API + docs; 'unsafe-eval' требуется Swagger UI (redoc/swagger js)
     response.headers["Content-Security-Policy"] = (
         "default-src 'self'; script-src 'self' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; "
@@ -150,7 +162,9 @@ async def security_headers(request: Request, call_next):
     )
     # HSTS только на HTTPS (через config, чтобы не ломать локальную разработку по http)
     if config.HSTS_ENABLED:
-        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+        response.headers["Strict-Transport-Security"] = (
+            "max-age=31536000; includeSubDomains"
+        )
     return response
 
 
@@ -160,8 +174,13 @@ async def access_log(request: Request, call_next):
     response = await call_next(request)
     ms = (time.perf_counter() - start) * 1000
     if config.LOG_ACCESS_ENABLED:
-        log.info("%s %s -> %s (%.1f ms)", request.method, request.url.path,
-                 response.status_code, ms)
+        log.info(
+            "%s %s -> %s (%.1f ms)",
+            request.method,
+            request.url.path,
+            response.status_code,
+            ms,
+        )
     return response
 
 
@@ -169,6 +188,7 @@ async def access_log(request: Request, call_next):
 fastapi_app.include_router(auth_router)
 fastapi_app.include_router(chats_router)
 fastapi_app.include_router(messages_router)
+fastapi_app.include_router(reactions_router)
 fastapi_app.include_router(files_router)
 fastapi_app.include_router(admin_router)
 
@@ -205,12 +225,12 @@ def _extract_ws_token(websocket: WebSocket) -> tuple[Optional[int], Optional[str
     raw_protocols = websocket.headers.get("sec-websocket-protocol", "")
     for item in (p.strip() for p in raw_protocols.split(",")):
         if item.startswith("bearer.") and len(item) > len("bearer."):
-            user = auth.decode_token(item[len("bearer."):])
+            user = auth.decode_token(item[len("bearer.") :])
             if user is not None:
                 return user, item
     authorization = websocket.headers.get("authorization", "")
     if authorization.lower().startswith("bearer "):
-        user = auth.decode_token(authorization[len("bearer "):].strip())
+        user = auth.decode_token(authorization[len("bearer ") :].strip())
         if user is not None:
             return user, None
     return None, None

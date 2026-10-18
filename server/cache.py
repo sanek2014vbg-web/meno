@@ -7,6 +7,7 @@ Redis недоступен — все операции молча дегради
 
 Метод connect() вызывается из lifespan приложения (см. main.py).
 """
+
 import json
 import logging
 from typing import Any, Optional
@@ -37,7 +38,9 @@ class Cache:
         """Инициализирует соединение с Redis (best-effort)."""
         if self._redis is not None or not REDIS_URL:
             if not REDIS_URL:
-                logger.info("MENO_REDIS_URL not set — cache disabled (in-process mode).")
+                logger.info(
+                    "MENO_REDIS_URL not set — cache disabled (in-process mode)."
+                )
             return
         try:
             client = aioredis.from_url(REDIS_URL, decode_responses=True)
@@ -45,7 +48,10 @@ class Cache:
             self._redis = client
             logger.info("Connected to Redis cache successfully.")
         except Exception as e:
-            logger.warning("Failed to connect to Redis (%s) — cache disabled.", e.__class__.__name__)
+            logger.warning(
+                "Failed to connect to Redis (%s) — cache disabled.",
+                e.__class__.__name__,
+            )
             self._redis = None
 
     async def get(self, key: str) -> Optional[Any]:
@@ -94,11 +100,22 @@ class Cache:
             # payload (new_message.message) в repr-строку — получатель на другом
             # воркере падал с "string indices must be integers". model_dump()
             # приводит модели к dict ДО json.dumps; datetime остаётся на default=str.
+            # Дефект-фикс v1.0.0: модели могли лежать НЕ только в верхнеуровневых
+            # значениях (например, {"user_id":..,"payload": MessageResponse} —
+            # модель во вложенном dict). Рекурсивная нормализация чинит и этот
+            # класс, и будущие вложения; default=str остаётся последней линией
+            # обороны для datetime/Decimal, но больше не для BaseModel.
+            def _jsonable(v):
+                if hasattr(v, "model_dump"):
+                    return v.model_dump(mode="json")
+                if isinstance(v, dict):
+                    return {k: _jsonable(x) for k, x in v.items()}
+                if isinstance(v, (list, tuple)):
+                    return [_jsonable(x) for x in v]
+                return v
+
             if isinstance(payload, dict):
-                payload = {
-                    k: (v.model_dump(mode="json") if hasattr(v, "model_dump") else v)
-                    for k, v in payload.items()
-                }
+                payload = {k: _jsonable(v) for k, v in payload.items()}
             await self._redis.publish(channel, json.dumps(payload, default=str))
             return True
         except Exception as e:

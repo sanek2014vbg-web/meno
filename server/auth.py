@@ -1,4 +1,7 @@
 """MeNo — аутентификация: пароли (bcrypt), JWT, 2FA (TOTP), lockout, audit-лог."""
+
+import base64
+import hashlib
 import logging
 import secrets
 from datetime import timedelta
@@ -19,8 +22,6 @@ log = logging.getLogger("meno.auth")
 # bcrypt использует только первые 72 байта пароля; всё остальное отбрасывается.
 # Чтобы длинные пароли не теряли энтропию молча, пред-хешируем их SHA-256
 # (digest base64 < 72 байт всегда) — стандартная практика для bcrypt.
-import base64
-import hashlib
 
 # Детерминированный "фиктивный" хеш для атаки по времени (user enumeration):
 # при неизвестном username мы всё равно выполняем проверку пароля, чтобы
@@ -187,8 +188,13 @@ async def log_security_event(
                     "INSERT INTO security_events (event_type, user_id, username, ip, detail) "
                     "VALUES (:t, :u, :n, :i, :d)"
                 ),
-                {"t": event_type[:48], "u": user_id, "n": (username or "")[:64] or None,
-                 "i": (ip or "")[:64] or None, "d": detail[:2000]},
+                {
+                    "t": event_type[:48],
+                    "u": user_id,
+                    "n": (username or "")[:64] or None,
+                    "i": (ip or "")[:64] or None,
+                    "d": detail[:2000],
+                },
             )
     except Exception as exc:  # noqa: BLE001 — аудит best-effort, но с явной записью ошибки
         log.error("Failed to write security event %s: %s", event_type, exc)
@@ -208,7 +214,9 @@ async def get_user_by_id(user_id: int) -> Optional[dict]:
     if cached:
         return cached
     async with database.get_db() as db:
-        user = await database.aq1(db, "SELECT * FROM users WHERE id=:id", {"id": user_id})
+        user = await database.aq1(
+            db, "SELECT * FROM users WHERE id=:id", {"id": user_id}
+        )
     if user:
         await cache.set(cache_key, user, ttl=300)
     return user

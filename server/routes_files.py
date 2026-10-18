@@ -6,6 +6,7 @@
 Загрузка потоковая: файл читается чанками с лимитом размера, чтобы не
 съедать память сервера.
 """
+
 import logging
 import os
 import uuid
@@ -19,8 +20,21 @@ from server.rate_limit import limiter, user_key
 
 router = APIRouter(tags=["files"])
 
-ALLOWED_EXT = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".mp3", ".ogg", ".m4a", ".wav",
-               ".txt", ".pdf", ".zip", ".mp4"}
+ALLOWED_EXT = {
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".gif",
+    ".webp",
+    ".mp3",
+    ".ogg",
+    ".m4a",
+    ".wav",
+    ".txt",
+    ".pdf",
+    ".zip",
+    ".mp4",
+}
 CHUNK = 1024 * 1024  # 1 MiB
 
 log = logging.getLogger("meno.files")

@@ -23,6 +23,7 @@ PostgreSQL. Единственные источники данных:
 Низкоуровневые Redis-операции идут через синглтон ``server.cache.cache``
 (Этап 1.4); свой клиент модуль не создаёт.
 """
+
 from __future__ import annotations
 
 import json
@@ -33,11 +34,11 @@ from typing import Dict, Iterable, List, Optional, Tuple
 log = logging.getLogger("meno.typing")
 
 # --- Протокольные константы (должны совпадать с client/chat_ui.py) -----------
-TYPING_TTL_SECONDS = 6            # TTL ключа и окно отображения на клиенте
-TYPING_RATE_LIMIT_SECONDS = 2.0   # серверный anti-flood (зеркалит debounce клиента)
-TYPING_KEY_PREFIX = "typing"      # typing:{chat_id}:{user_id}
-TYPING_CHANNEL = "meno:typing"    # служебный канал для observability/тестов
-STOP_SENTINELS = ("", None)       # пустой текст == "перестал печатать"
+TYPING_TTL_SECONDS = 6  # TTL ключа и окно отображения на клиенте
+TYPING_RATE_LIMIT_SECONDS = 2.0  # серверный anti-flood (зеркалит debounce клиента)
+TYPING_KEY_PREFIX = "typing"  # typing:{chat_id}:{user_id}
+TYPING_CHANNEL = "meno:typing"  # служебный канал для observability/тестов
+STOP_SENTINELS = ("", None)  # пустой текст == "перестал печатать"
 
 
 def typing_key(chat_id: int, user_id: int) -> str:
@@ -162,7 +163,9 @@ class TypingService:
                 await cache.client.set(key, "1", ex=ttl)
                 return
             except Exception as exc:
-                log.warning("typing SETEX failed (%s) — local fallback", exc.__class__.__name__)
+                log.warning(
+                    "typing SETEX failed (%s) — local fallback", exc.__class__.__name__
+                )
         self._local[(chat_id, user_id)] = time.monotonic() + ttl
 
     async def _clear_state(self, chat_id: int, user_id: int) -> None:

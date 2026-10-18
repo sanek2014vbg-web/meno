@@ -9,6 +9,7 @@
 - SQLite (aiosqlite)  — self-hosted lite / тесты; PRAGMA-инициализация
   (WAL + busy_timeout) гасит гонки блокировок при конкурентном доступе.
 """
+
 import logging
 from typing import Any, Dict
 
@@ -34,21 +35,25 @@ def _engine_kwargs() -> Dict[str, Any]:
         kwargs.update(
             pool_size=pool_size,
             max_overflow=max_overflow,
-            pool_pre_ping=True,   # отбрасывает разорванные коннекты после рестарта PG
-            pool_recycle=1800,    # короче typical idle timeout pgbouncer/pg
+            pool_pre_ping=True,  # отбрасывает разорванные коннекты после рестарта PG
+            pool_recycle=1800,  # короче typical idle timeout pgbouncer/pg
         )
     return kwargs
 
 
 engine = create_async_engine(DATABASE_URL, **_engine_kwargs())
 
-AsyncSessionLocal = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
+AsyncSessionLocal = async_sessionmaker(
+    bind=engine, class_=AsyncSession, expire_on_commit=False
+)
 
 
 if IS_SQLITE:
 
     @event.listens_for(engine.sync_engine, "connect")
-    def _sqlite_pragmas(dbapi_conn, _conn_record):  # pragma: no cover - инфраструктурный хук
+    def _sqlite_pragmas(
+        dbapi_conn, _conn_record
+    ):  # pragma: no cover - инфраструктурный хук
         """PRAGMA для SQLite: WAL снимает writer↔reader блокировки,
         busy_timeout превращает мгновенные 'database is locked' в ожидание.
         Дефект-фикс №1 (гонки блокировок в тестах).
@@ -66,7 +71,9 @@ if IS_SQLITE:
         finally:
             cur.close()
         # det=True: строки приходят как Python str (utf-8), а не bytes.
-        dbapi_conn.create_function("lower", 1, lambda s: s.lower() if s else s, deterministic=True)
+        dbapi_conn.create_function(
+            "lower", 1, lambda s: s.lower() if s else s, deterministic=True
+        )
 
 else:
 
