@@ -175,6 +175,12 @@ async def login(body: LoginRequest, request: Request):
 
     user = await auth.get_user_by_username(username)
     if not user:
+        # Защита от user enumeration: выполняем проверку пароля против
+        # фиктивного хеша, чтобы ответ для несуществующего пользователя
+        # занимал столько же времени, сколько для существующего.
+        await asyncio.to_thread(
+            auth.check_password, body.password, auth._DUMMY_PASSWORD_HASH
+        )
         await auth.log_security_event("login_failed", username=username,
                                       ip=request.client.host if request.client else None,
                                       detail="unknown user")
@@ -185,7 +191,12 @@ async def login(body: LoginRequest, request: Request):
         wait_min = int((until - utc_now()).total_seconds() / 60) + 1
         raise HTTPException(403, f"Аккаунт временно заблокирован. Попробуйте через {wait_min} мин.")
 
-    if not auth.check_password(body.password, user["password_hash"]):
+    # bcrypt — CPU-интенсивная операция (~300мс); выносим в поток,
+    # чтобы не блокировать event loop под нагрузкой.
+    password_matches = await asyncio.to_thread(
+        auth.check_password, body.password, user["password_hash"]
+    )
+    if not password_matches:
         await auth.record_failed_attempt(user["id"])
         await auth.log_security_event("login_failed", user_id=user["id"], username=username,
                                       ip=request.client.host if request.client else None,

@@ -276,6 +276,9 @@ async def send_message(
             "INSERT INTO messages (chat_id, sender_id, type, content, media_path, "
             "duration, ttl_seconds, view_once, e2e, client_id, created_at"
         )
+        # Дефект-фикс: ранее в dict входил ключ "ttl", а в списке колонок — "ttl_seconds";
+        # при expires_at=None получалось 12 плейсхолдеров на 11 колонок.
+        # Ключи params теперь строго соответствуют колонкам + ":name"-плейсхолдерам.
         insert_params = {
                     "chat_id": chat_id,
                     "sender_id": user["id"],
@@ -283,8 +286,7 @@ async def send_message(
                     "content": body.content.strip(),
                     "media_path": body.media_path,
                     "duration": body.duration or 0,
-                    "ttl": body.ttl_seconds,
-                    "expires_at": expires_at,
+                    "ttl_seconds": body.ttl_seconds,
                     "view_once": 1 if body.view_once else 0,
                     "e2e": 1 if body.e2e else 0,
                     "client_id": body.client_id,
@@ -297,7 +299,7 @@ async def send_message(
         insert_sql += ") VALUES (" + ", ".join(
             f":{k}" for k in (
                 ["chat_id", "sender_id", "type", "content", "media_path", "duration",
-                 "ttl", "view_once", "e2e", "client_id", "created_at"]
+                 "ttl_seconds", "view_once", "e2e", "client_id", "created_at"]
                 + (["expires_at"] if "expires_at" in insert_params else [])
             )
         ) + ")"

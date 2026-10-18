@@ -16,15 +16,38 @@ from server.utils import as_utc, utc_now
 log = logging.getLogger("meno.auth")
 
 # ---------- Пароли ----------
+# bcrypt использует только первые 72 байта пароля; всё остальное отбрасывается.
+# Чтобы длинные пароли не теряли энтропию молча, пред-хешируем их SHA-256
+# (digest base64 < 72 байт всегда) — стандартная практика для bcrypt.
+import base64
+import hashlib
+
+# Детерминированный "фиктивный" хеш для атаки по времени (user enumeration):
+# при неизвестном username мы всё равно выполняем проверку пароля, чтобы
+# ответ занимал столько же времени, сколько при существующем пользователе.
+
+
+def _gensalt():
+    """Cost factor из конфига: прод — 12 раундов, тесты (MENO_BCRYPT_ROUNDS=4) — быстро."""
+    return bcrypt.gensalt(rounds=config.BCRYPT_ROUNDS)
+
+
+_DUMMY_PASSWORD_HASH = bcrypt.hashpw(b"meno-timing-equalizer", _gensalt()).decode()
+
+
+def _prehash(password: str) -> bytes:
+    """SHA-256 -> base64: гарантирует, что в bcrypt попадает полные 72 байта."""
+    digest = hashlib.sha256(password.encode("utf-8")).digest()
+    return base64.b64encode(digest)
 
 
 def hash_password(password: str) -> str:
-    return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+    return bcrypt.hashpw(_prehash(password), _gensalt()).decode()
 
 
 def check_password(password: str, password_hash: str) -> bool:
     try:
-        return bcrypt.checkpw(password.encode(), password_hash.encode())
+        return bcrypt.checkpw(_prehash(password), password_hash.encode())
     except ValueError:
         return False
 
@@ -97,23 +120,35 @@ def is_account_locked(user: dict) -> tuple[bool, Optional[object]]:
 
 
 async def record_failed_attempt(user_id: int) -> None:
-    """Увеличивает счётчик неудач и включает блокировку при достижении лимита."""
+    """Увеличивает счётчик неудач и включает блокировку при достижении лимита.
+
+    Атомарная реализация (без TOCTOU-гонки SELECT+UPDATE): один UPDATE
+    инкрементирует счётчик в БД, затем читается актуальное значение;
+    блокировка проставляется отдельным условным UPDATE только при
+    достижении лимита.
+    """
     async with database.get_db() as db:
-        user = await database.aq1(
+        res = await db.execute(
+            sql_text(
+                "UPDATE users SET failed_attempts = COALESCE(failed_attempts, 0) + 1 "
+                "WHERE id=:id"
+            ),
+            {"id": user_id},
+        )
+        if res.rowcount == 0:
+            return
+        attempts_row = await database.aq1(
             db, "SELECT failed_attempts FROM users WHERE id=:id", {"id": user_id}
         )
-        if not user:
-            return
-        attempts = (user["failed_attempts"] or 0) + 1
-        lockout_until = None
-        if attempts >= MAX_FAILED_ATTEMPTS:
+        attempts = attempts_row["failed_attempts"] if attempts_row else None
+        if attempts is not None and attempts >= MAX_FAILED_ATTEMPTS:
             lockout_until = utc_now() + timedelta(minutes=LOCKOUT_DURATION_MINUTES)
-        await db.execute(
-            sql_text(
-                "UPDATE users SET failed_attempts=:a, lockout_until=:l WHERE id=:id"
-            ),
-            {"a": attempts, "l": lockout_until, "id": user_id},
-        )
+            await db.execute(
+                sql_text(
+                    "UPDATE users SET lockout_until=:l WHERE id=:id AND lockout_until IS NULL"
+                ),
+                {"l": lockout_until, "id": user_id},
+            )
     await _invalidate_user_cache(user_id)
 
 

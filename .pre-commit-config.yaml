@@ -1,0 +1,20 @@
+# Pre-commit hooks: автоматический контроль качества перед каждым коммитом.
+# Установка: pip install pre-commit && pre-commit install
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: check-yaml
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: check-added-large-files
+        args: ["--maxkb=512"]
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.6.9
+    hooks:
+      # Линтинг с автоисправлением (F/E/I/UP/B)
+      - id: ruff
+        args: ["--fix", "--exit-non-zero-on-fix"]
+      # Форматирование (черный-совместимый стиль, тот же что в CI)
+      - id: ruff-format

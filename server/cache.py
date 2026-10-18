@@ -85,10 +85,20 @@ class Cache:
 
     # --- Pub/Sub (для WebSocket-шины между воркерами, Этап 5.1) ---
 
-    async def publish(self, channel: str, payload: dict) -> bool:
+    async def publish(self, channel: str, payload) -> bool:
         if not self._redis:
             return False
         try:
+            # Дефект-фикс (Этап 5.1, интеграционный тест pub/sub fan-out):
+            # сериализация через default=str превращала Pydantic-модели внутри
+            # payload (new_message.message) в repr-строку — получатель на другом
+            # воркере падал с "string indices must be integers". model_dump()
+            # приводит модели к dict ДО json.dumps; datetime остаётся на default=str.
+            if isinstance(payload, dict):
+                payload = {
+                    k: (v.model_dump(mode="json") if hasattr(v, "model_dump") else v)
+                    for k, v in payload.items()
+                }
             await self._redis.publish(channel, json.dumps(payload, default=str))
             return True
         except Exception as e:

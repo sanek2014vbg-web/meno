@@ -19,6 +19,9 @@ if str(ROOT) not in sys.path:
 
 # --- Окружение теста ДО импорта server.config (конфиг читается однократно) ---
 os.environ["MENO_DEV_ENV"] = "1"            # разрешает эфемерный dev-секрет JWT
+# Быстрый bcrypt в тестах (cost 4 вместо 12): иначе 16 интеграционных тестов
+# с регистациями тратят минуты на CPU-bound хеширование и прогон «зависает».
+os.environ.setdefault("MENO_BCRYPT_ROUNDS", "4")
 _TEST_DB = os.environ.get("MENO_TEST_DATABASE_URL", "")
 if not _TEST_DB:
     _TEST_DB = "sqlite+aiosqlite:///" + str(ROOT / "tests" / "meno_test.db")

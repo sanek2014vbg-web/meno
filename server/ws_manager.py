@@ -94,9 +94,23 @@ class WSManager:
             async for msg in ps.listen():
                 if msg.get("type") != "message":
                     continue
+                data = msg["data"]
+                # Дефект-фикс (двойная декодировка): redis-клиент с
+                # decode_responses=True возвращает payload строкой, а не bytes.
+                # json.loads(bytes|str) работает сам — повторный loads отсюда
+                # превращал объект в строку и ронял потребителя с
+                # "string indices must be integers".
+                if isinstance(data, (bytes, bytearray)):
+                    data = data.decode("utf-8", "replace")
                 try:
-                    data = json.loads(msg["data"])
+                    data = json.loads(data)
                 except (TypeError, ValueError):
+                    pass
+                # Защита от двойного декодирования: если подписчик уже вернул
+                # словарь (decode_responses / эмуляции транспорта), не делаем
+                # повторный loads по dict — иначе str(dict)-проход превращает
+                # вложенные объекты в строки ("string indices must be integers").
+                if not isinstance(data, dict):
                     continue
                 uid = data.get("user_id")
                 payload = data.get("payload")
