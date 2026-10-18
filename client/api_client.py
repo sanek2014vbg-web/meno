@@ -300,7 +300,7 @@ class ApiClient:
                     continue
                 raise ApiError(0, f"Нет соединения с сервером ({exc.__class__.__name__})")
             if r.status_code in (502, 503, 504) and attempt < MAX_RETRIES:
-                await asyncio.sleep(_retry_//_retry_delay(attempt))
+                await asyncio.sleep(_retry_delay(attempt))
                 continue
             break
 
@@ -345,10 +345,18 @@ class ApiClient:
     ):
         import websockets
 
+        # Фаза 2.3: JWT НЕ передаётся в query-параметре URL (/ws?token=...) —
+        # query оседает в логах reverse-proxy и истории. Токен передаётся:
+        #   1) subprotocol "bearer.<JWT>" (заголовок Sec-WebSocket-Protocol) —
+        #      стандартный RFC 6455 способ для браузеров и любых клиентов;
+        #   2) заголовок Authorization: Bearer <JWT> — как дублирующий канал
+        #      (сервер принимает оба).
         uri = self.base_url.replace("http", "ws") + "/ws"
         auth_headers = {"Authorization": f"Bearer {self.token}"} if self.token else {}
         ws_kwargs = dict(ping_interval=20, ping_timeout=20, close_timeout=5,
                          max_size=4 * 1024 * 1024)
+        if self.token:
+            ws_kwargs["subprotocols"] = [f"bearer.{self.token}"]
         try:
             ws_version = int(str(getattr(websockets, "__version__", "0")).split(".")[0])
         except Exception:

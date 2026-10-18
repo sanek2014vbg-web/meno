@@ -1,0 +1,65 @@
+# Конфигурация инструментов качества кода MeNo Messenger.
+# Pytest-настройки живут в pytest.ini, линтер — в ruff.toml (не меняем поведение CI).
+
+[tool.mypy]
+python_version = "3.12"
+files = ["server", "client"]
+# Плоская структура клиента (sys.path = client/): фиксируем базовый путь,
+# чтобы модули не находились дважды под разными именами.
+# Развязываем имена пакетов server/ и client/ (оба содержат main.py): mypy
+# иначе видит два модуля с именем "main".
+namespace_packages = true
+explicit_package_bases = true
+disallow_untyped_defs = true
+check_untyped_defs = true
+warn_return_any = true
+warn_unused_ignores = false
+ignore_missing_imports = true
+no_implicit_optional = true
+strict_equality = true
+exclude = [
+    "^build/",
+    "^dist/",
+    "^\\.venv/",
+    # Корневой conftest.py и client/conftest.py — один и тот же модуль для mypy;
+    # тестовый conftest проверяется через tests/ (pytest), не через mypy.
+    "^conftest\\.py$",
+    "^client/run_web\\.py$",
+]
+
+[[tool.mypy.overrides]]
+module = "flet.*"
+ignore_missing_imports = true
+follow_imports = "skip"
+
+[[tool.mypy.overrides]]
+module = ["boto3.*", "botocore.*", "jwt.*", "bcrypt.*"]
+ignore_missing_imports = true
+
+# ---------------------------------------------------------------------------
+# Постепенная строгость: глобально включены disallow_untyped_defs/check_untyped_
+# defs/warn_return_any (см. [tool.mypy] выше). Legacy-модули, не вошедшие в
+# пилот Фазы 5, временно ослаблены — каждый последующий спринт снимает один
+# override по мере аннотирования. Критические модули (server/main.py,
+# client/crypto.py, client/api_client.py) аннотированы и проверяются строго.
+# ---------------------------------------------------------------------------
+
+[[tool.mypy.overrides]]
+module = [
+    "client.screens.*",
+    "client.auth_storage",
+    "client.themes",
+    "client.icons",
+    "client.icons_compat",
+    "client.make_logo",
+    "client.ui.*",
+    "client.main",
+    "server.routes_*",
+    "server.services.janitor",
+    "server.s3_manager",
+    "server.push",
+    "server.tokens",
+]
+disallow_untyped_defs = false
+check_untyped_defs = false
+warn_return_any = false

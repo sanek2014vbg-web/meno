@@ -402,15 +402,50 @@ async def test_ws_manager_inprocess_delivery_without_redis(client, user_alice, m
 
 @pytest.mark.asyncio
 async def test_ws_endpoint_auth_rejects_bad_token():
-    """HTTP-уровень: /ws без валидного access-токена закрывается кодом 4401."""
+    """HTTP-уровень: /ws без валидного access-токена закрывается кодом 4401.
+
+    Фаза 2.3: токен передаётся subprotocol'ом "bearer.<JWT>", а не query-параметром.
+    Невалидный токен в subprotocol и отсутствие токена — оба сценария отказа.
+    """
     with TestClient(app) as tc:
         try:
-            with tc.websocket_connect("/ws?token=garbage") as ws:
+            with tc.websocket_connect(
+                "/ws", subprotocols=["bearer.garbage"]
+            ) as ws:
                 with pytest.raises(Exception):
                     ws.receive_json()
         except WebSocketDisconnect:
             # close() до accept — штатный сценарий отказа авторизации.
             pass
+        # Query-параметр token больше не поддерживается (утечка в логи прокси).
+        try:
+            with tc.websocket_connect("/ws?token=garbage") as ws:
+                with pytest.raises(Exception):
+                    ws.receive_json()
+        except WebSocketDisconnect:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_ws_endpoint_accepts_subprotocol_token(client_as_user):
+    """Фаза 2.3: успешный handshake с токеном в Sec-WebSocket-Protocol."""
+    tc, tokens = client_as_user
+    with tc.websocket_connect(
+        "/ws", subprotocols=[f"bearer.{tokens['alice']}"]
+    ) as ws_a:
+        ws_a.send_json({"type": "ping"})
+        assert ws_a.receive_json()["type"] == "pong"
+
+
+@pytest.mark.asyncio
+async def test_ws_endpoint_accepts_authorization_header(client_as_user):
+    """Фаза 2.3: альтернативный канал — Authorization: Bearer <JWT> в заголовках."""
+    tc, tokens = client_as_user
+    with tc.websocket_connect(
+        "/ws", headers={"Authorization": f"Bearer {tokens['alice']}"}
+    ) as ws_a:
+        ws_a.send_json({"type": "ping"})
+        assert ws_a.receive_json()["type"] == "pong"
 
 
 @pytest.mark.asyncio
@@ -419,8 +454,11 @@ async def test_ws_endpoint_delivers_typing(client_as_user):
     client_typing от alice доставляется bob как user_typing через WS-менеджер.
     Zero DB-touch: состав чата берётся из кеша, БД не касается горячий путь."""
     tc, tokens = client_as_user
-    with tc.websocket_connect(f"/ws?token={tokens['alice']}") as ws_a, \
-         tc.websocket_connect(f"/ws?token={tokens['bob']}") as ws_b:
+    with tc.websocket_connect(
+        "/ws", subprotocols=[f"bearer.{tokens['alice']}"]
+    ) as ws_a, tc.websocket_connect(
+        "/ws", subprotocols=[f"bearer.{tokens['bob']}"]
+    ) as ws_b:
         ws_a.send_json({"type": "ping"})
         assert ws_a.receive_json()["type"] == "pong"
 

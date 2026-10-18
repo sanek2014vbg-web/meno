@@ -50,6 +50,14 @@ def _normalize_db_url(url: str) -> str:
 # DEV_ENV=1 разрешает запуск с временным dev-секретом JWT (только локальная разработка).
 DEV_ENV = _env_bool("MENO_DEV_ENV", False)
 
+# --- bcrypt cost factor ---
+# В проде — стандартные 12 раундов. В тестах MENO_BCRYPT_ROUNDS=4 ускоряет
+# хеширование в ~256 раз (иначе 16 интеграционных тестов с регистрациями
+# тратят минуты на CPU-bound bcrypt). Явный env-флаг вместо магического
+# TESTING: прод по умолчанию не затронут, подделать поведение можно только
+# осознанной переменной окружения.
+BCRYPT_ROUNDS = min(max(_env_int("MENO_BCRYPT_ROUNDS", 12), 4), 15)
+
 # --- Database ---
 # PostgreSQL: postgresql+asyncpg://user:pass@host:port/dbname
 # Локально без сервера можно использовать SQLite: sqlite+aiosqlite:///./meno.db
@@ -141,6 +149,10 @@ RL_TRUST_PROXY = _env_bool("MENO_RL_TRUST_PROXY", True)   # учитывать X
 # --- Логирование ---
 # access-лог uvicorn отключаем: в query-параметрах может оказаться токен.
 LOG_ACCESS_ENABLED = _env_bool("MENO_LOG_ACCESS", True)
+
+# --- HTTP Security ---
+# HSTS включать только когда сервис обслуживается по HTTPS (за nginx/traefik).
+HSTS_ENABLED = _env_bool("MENO_HSTS_ENABLED", False)
 
 # --- CORS ---
 # По умолчанию — пусто (без внешних origins). Для веб-клиента перечислите

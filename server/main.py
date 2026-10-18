@@ -18,6 +18,8 @@ import asyncio
 import logging
 import time
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
+from typing import Optional
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -74,15 +76,58 @@ async def lifespan(app: FastAPI):
     await cache.close()
 
 
-app = FastAPI(
+fastapi_app = FastAPI(
     title="MeNo Messenger API",
     version="0.2.0",
     description="Self-hosted мессенджер: PostgreSQL + Redis, JWT auth, E2EE, FCM push.",
     lifespan=lifespan,
 )
 
+
+# --- WebSocket subprotocol echo (Фаза 2.3) -------------------------------
+# WS-хэндлер валидирует JWT из заголовка Sec-WebSocket-Protocol ("bearer.<JWT>")
+# и кладёт согласованный протокол в contextvar. Явный websocket.accept() внутри
+# хэндлера ломает state machine Starlette-маршрута (accept выполняет сама
+# route-обёртка), поэтому чистый ASGI-слой ниже дописывает "subprotocol" в
+# websocket.accept-сообщение до того, как оно уйдёт клиенту. Handshake остаётся
+# корректным на любой starlette (включая ту, что не умеет accept(subprotocol=)).
+_ws_negotiated_protocol: ContextVar[Optional[str]] = ContextVar(
+    "ws_negotiated_protocol", default=None
+)
+
+
+class WsSubprotocolEchoMiddleware:
+    """ASGI-middleware: эхо согласованного Sec-WebSocket-Protocol в accept."""
+
+    def __init__(self, asgi_app):
+        self.asgi_app = asgi_app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "websocket":
+            await self.asgi_app(scope, receive, send)
+            return
+
+        token = _ws_negotiated_protocol.set(None)
+
+        async def send_wrapper(message):
+            if message["type"] == "websocket.accept":
+                protocol = _ws_negotiated_protocol.get()
+                if protocol and "subprotocol" not in message:
+                    message = {**message, "subprotocol": protocol}
+            await send(message)
+
+        try:
+            await self.asgi_app(scope, receive, send_wrapper)
+        finally:
+            _ws_negotiated_protocol.reset(token)
+
+
+# Оборачиваем FastAPI-приложение ASGI-слоем эха subprotocol; HTTP-маршруты
+# (@fastapi_app.get и т.д.) продолжают регистрироваться на внутреннем приложении.
+app = WsSubprotocolEchoMiddleware(fastapi_app)
+
 # CORS (Этап 2.7): в проде — только явно заданные origins
-app.add_middleware(
+fastapi_app.add_middleware(
     CORSMiddleware,
     allow_origins=config.CORS_ORIGINS,
     allow_methods=["*"],
@@ -90,7 +135,26 @@ app.add_middleware(
 )
 
 
-@app.middleware("http")
+@fastapi_app.middleware("http")
+async def security_headers(request: Request, call_next):
+    """Базовые защитные HTTP-заголовки (OWASP A05 - Security Misconfiguration)."""
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(self), geolocation=()"
+    # CSP: API + docs; 'unsafe-eval' требуется Swagger UI (redoc/swagger js)
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; script-src 'self' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data: blob:; connect-src 'self' ws: wss:; frame-ancestors 'none'; base-uri 'self'"
+    )
+    # HSTS только на HTTPS (через config, чтобы не ломать локальную разработку по http)
+    if config.HSTS_ENABLED:
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    return response
+
+
+@fastapi_app.middleware("http")
 async def access_log(request: Request, call_next):
     start = time.perf_counter()
     response = await call_next(request)
@@ -102,14 +166,14 @@ async def access_log(request: Request, call_next):
 
 
 # --- Маршруты ---
-app.include_router(auth_router)
-app.include_router(chats_router)
-app.include_router(messages_router)
-app.include_router(files_router)
-app.include_router(admin_router)
+fastapi_app.include_router(auth_router)
+fastapi_app.include_router(chats_router)
+fastapi_app.include_router(messages_router)
+fastapi_app.include_router(files_router)
+fastapi_app.include_router(admin_router)
 
 
-@app.get("/health")
+@fastapi_app.get("/health")
 async def health():
     """Liveness/readiness: БД + Redis (если настроен)."""
     checks = {}
@@ -125,12 +189,49 @@ async def health():
     return {"status": status, "checks": checks}
 
 
-@app.websocket("/ws")
-async def ws_endpoint(websocket: WebSocket, token: str = ""):
-    user = auth.decode_token(token)
+def _extract_ws_token(websocket: WebSocket) -> tuple[Optional[int], Optional[str]]:
+    """Извлекает access-токен из безопасного транспорта (Фаза 2.3).
+
+    Приоритет источников (JWT больше НЕ читается из query-параметра URL —
+    query оседает в логах reverse-proxy/CDN и истории):
+      1. Заголовок Sec-WebSocket-Protocol: клиент обязан заявить протокол вида
+         "bearer.<JWT>" (RFC 6455; браузеры не могут задавать произвольные
+         заголовки при WS-handshake — subprotocol является стандартным
+         обходным путём для авторизации).
+      2. Заголовок Authorization: Bearer <JWT> (небраузерные клиенты:
+         python-websockets, мобильный клиент MeNo).
+    Возвращает (user_id | None, negotiated_subprotocol | None).
+    """
+    raw_protocols = websocket.headers.get("sec-websocket-protocol", "")
+    for item in (p.strip() for p in raw_protocols.split(",")):
+        if item.startswith("bearer.") and len(item) > len("bearer."):
+            user = auth.decode_token(item[len("bearer."):])
+            if user is not None:
+                return user, item
+    authorization = websocket.headers.get("authorization", "")
+    if authorization.lower().startswith("bearer "):
+        user = auth.decode_token(authorization[len("bearer "):].strip())
+        if user is not None:
+            return user, None
+    return None, None
+
+
+@fastapi_app.websocket("/ws")
+async def ws_endpoint(websocket: WebSocket):
+    user, negotiated_protocol = _extract_ws_token(websocket)
     if not user:
+        # 4401 — кастомный кодclose: «unauthorized» (аналог HTTP 401).
         await websocket.close(code=4401)
         return
+    # Эхо согласованного subprotocol обязательно, если токен пришёл в нём:
+    # без него websockets/flet оборвут соединение с "missing subprotocol".
+    # Явный websocket.accept() здесь запрещён жизненным циклом Starlette
+    # (first AcceptWebSocketSubset depends on request.scope["asgi"]["version"]==1):
+    # accept() выполняет route-обёртка @app.websocket — поэтому протокол
+    # передаётся через contextvar, который читает кастомный ASGI-middleware
+    # WsSubprotocolEchoMiddleware (см. ниже).
+    if negotiated_protocol:
+        _ws_negotiated_protocol.set(negotiated_protocol)
     await manager.connect(user, websocket)
     try:
         while True:

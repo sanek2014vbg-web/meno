@@ -1,10 +1,6 @@
 __pycache__/
 *.pyc
 *.log
-*.tmp
-.env
-.env.local
-.env.*
 *.db
 *.db-shm
 *.db-wal
