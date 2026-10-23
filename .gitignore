@@ -11,3 +11,11 @@ __pycache__/
 *.db
 *.db-wal
 *.db-shm
+
+.pytest_cache/
+**/__pycache__/
+*.db
+*.sqlite3
+
+.qwen/
+gha-creds-*.json
