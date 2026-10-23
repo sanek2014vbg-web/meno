@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from server.config import IS_SQLITE
 from server.db.connection import AsyncSessionLocal, engine
-from server.db.models_base import Base
+from server.db.models_base import Base, JanitorJob
 from server.utils import as_utc, utc_now
 
 logger = logging.getLogger("meno.db.session")

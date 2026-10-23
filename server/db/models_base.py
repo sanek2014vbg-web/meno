@@ -70,6 +70,32 @@ class Chat(Base):
     created_at = Column(DateTime, server_default=text("CURRENT_TIMESTAMP"))
 
 
+class ChatInvite(Base):
+    """Одноразовые инваит-ссылки в чат с TTL (каркас интеграции Пункта 5 аудита).
+
+    Демонстрирует контракт «новая таблица с TTL подключается к дворнику
+    РЕГИСТРАЦИЕЙ СТРОКИ janitor_jobs, а не правкой цикла»: джоба
+    'chat_invites_ttl' вычищает строки с expires_at <= now - grace.
+    """
+
+    __tablename__ = "chat_invites"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    chat_id = Column(
+        Integer, ForeignKey("chats.id", ondelete="CASCADE"), nullable=False
+    )
+    code = Column(String(64), unique=True, nullable=False)
+    created_by = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    max_uses = Column(Integer, nullable=False, server_default="1")
+    uses = Column(Integer, nullable=False, server_default="0")
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    created_at = Column(DateTime, server_default=text("CURRENT_TIMESTAMP"))
+
+    __table_args__ = (
+        Index("idx_chat_invites_expires_at", "expires_at"),
+        Index("idx_chat_invites_chat", "chat_id"),
+    )
+
+
 class ChatMember(Base):
     __tablename__ = "chat_members"
     chat_id = Column(
@@ -259,3 +285,99 @@ class SecurityEvent(Base):
         Index("idx_security_events_type_ts", "event_type", "ts"),
         Index("idx_security_events_user", "user_id"),
     )
+
+
+class JanitorJob(Base):
+    """Реестр фоновых TTL-задач дворника (архитектурный аудит, Пункт 5).
+
+    Каждая строка описывает ОДИН регламент очистки:
+      job            — каноническое имя ('messages_ttl', 'refresh_tokens', ...);
+      table_name     — обслуживаемая таблица;
+      ttl_column     — колонка с абсолютным дедлайном (expires_at);
+      grace_seconds  — дополнительный льготный период после дедлайна;
+      interval_seconds — минимальный возраст последней успешной волны;
+      enabled        — выключатель без изменения кода;
+      status         — состояние advisory-лока ('idle' | 'running'):
+                       атомарный UPDATE status='idle'->'running' гарантирует,
+                       что на SQLite (нет SELECT FOR UPDATE) и PostgreSQL
+                       волну выполняет ровно один воркер за раз;
+      owner          — идентификатор воркера-локера (observability);
+      last_run_at / last_deleted_count — телеметрия последнего тика.
+
+    janitor (server/services/janitor.py) читает реестр каждый тик: новые
+    таблицы с TTL подключаются РЕГИСТРАЦИЕЙ СТРОКИ (миграция/админ-команда),
+    а не правкой цикла дворника.
+    """
+
+    __tablename__ = "janitor_jobs"
+    job = Column(String(64), primary_key=True)
+    table_name = Column(String(64), nullable=False)
+    ttl_column = Column(String(64), nullable=False, server_default="expires_at")
+    grace_seconds = Column(Integer, nullable=False, server_default="0")
+    interval_seconds = Column(Integer, nullable=False, server_default="60")
+    enabled = Column(Boolean, nullable=False, server_default="1")
+    status = Column(String(16), nullable=False, server_default="idle")
+    owner = Column(String(64), nullable=True)
+    last_run_at = Column(DateTime(timezone=True), nullable=True)
+    last_deleted_count = Column(Integer, nullable=False, server_default="0")
+    updated_at = Column(
+        DateTime(timezone=True), server_default=text("CURRENT_TIMESTAMP"), nullable=False
+    )
+
+    __table_args__ = (Index("idx_janitor_jobs_enabled_status", "enabled", "status"),)
+
+
+class ComplianceAuditLog(Base):
+    """Официальный корпоративный DLP-журнал (Data Loss Prevention / комплаенс).
+
+    Политика хранения объявлена в пользовательском соглашении (Privacy Policy):
+    все сообщения платформы журналируются для защиты интеллектуальной
+    собственности и расследования инцидентов. Исчезающие сообщения
+    (messages.ttl_seconds IS NOT NULL) удаляются из основной таблицы дворником
+    по expires_at — ДЛИТЕЛЬНЫЙ ЖУРНАЛ является единственным легальным способом
+    сохранить доказательную копию для аудита утечек и судебных разбирательств.
+
+    Прозрачность системы обеспечивается тремя механизмами:
+      1. Факт журналирования зафиксирован в пользовательском соглашении;
+      2. WS-событие каждого сохраняемого сообщения содержит поле
+         ``compliance_logged`` (см. server/services/message_send.deliver) —
+         любой клиент может показать это пользователю;
+      3. Каждое чтение журнала возможно только superadmin'ом и пишется в
+         security_events + транслируется в админский тап (неизменяемый аудит
+         доступа к журналу).
+
+    Идемпотентность: UNIQUE(message_id) — повторный захват (переотправка с тем
+    же client_id, рестарт транзакции) не создаёт дублей записи.
+    author_id намеренно Integer БЕЗ ForeignKey: удалённый аккаунт не должен
+    каскадно стирать журнал комплаенса (требование DLP — записи переживают
+    субъекта). FK chat_id с ondelete="SET NULL": удаление чата тоже не должно
+    уничтожать доказательства.
+
+    Доступ к таблице — ТОЛЬКО через админский контур
+    (/api/admin/compliance-logs, двойной контур: admin-JWT + one-time билет);
+    ни один пользовательский роут её не читает.
+    """
+
+    __tablename__ = "compliance_audit_logs"
+    id = Column(String(36), primary_key=True)  # UUID v4 (сгенерирован при INSERT)
+    message_id = Column(Integer, nullable=False, unique=True)
+    chat_id = Column(
+        Integer, ForeignKey("chats.id", ondelete="SET NULL"), nullable=True
+    )
+    author_id = Column(Integer, nullable=False)
+    # Колонка называется `body` (не `text`): имя `text` затенило бы
+    # sqlalchemy.text в теле класса и сломало server_default ниже —
+    # классический collision имён атрибутов/функций в declarative-моделях.
+    body = Column(Text, nullable=False, server_default="")
+    logged_at = Column(
+        DateTime(timezone=True),
+        server_default=text("CURRENT_TIMESTAMP"),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        # Основной путь выборки в панели мониторинга: страница журнала по чату,
+        # newest-first (seek по составному индексу за O(log N + limit)).
+        Index("idx_compliance_logs_chat_logged", "chat_id", "logged_at"),
+    )
+

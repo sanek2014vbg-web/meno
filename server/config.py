@@ -160,6 +160,16 @@ S3_SECRET_KEY = _env("MENO_S3_SECRET_KEY")
 S3_REGION = _env("MENO_S3_REGION", "us-east-1")
 S3_USE_SSL = _env_bool("MENO_S3_USE_SSL", True)
 
+# --- Локализация серверных текстов (ошибки API, push-заголовки) ---
+# Активный язык ответов об ошибках: ru (по умолчанию) | en.
+MENO_LANGUAGE = _env("MENO_LANGUAGE", "ru").lower()
+
+# --- SuperAdmin tap (MeNo Admin Center & Monitor) ---
+# Временный флаг совместимости: 1 — принимать на handshake тапа legacy
+# scoped-JWT (?token=...), 0 (безопасное значение по умолчанию) — только
+# one-time билеты POST /api/admin/ws-ticket. Снять после миграции клиентов.
+MENO_ADMIN_TAP_LEGACY_TOKEN = _env_bool("MENO_ADMIN_TAP_LEGACY_TOKEN", False)
+
 # --- Антиспам ---
 SPAM_MSG_PER_MINUTE = _env_int(
     "MENO_SPAM_MSG_PER_MINUTE", 20

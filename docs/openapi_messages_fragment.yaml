@@ -1,0 +1,422 @@
+# MeNo Messenger — фрагмент OpenAPI 3.0: эндпоинты сообщений с локализованными ошибками.
+#
+# Источник истины для текстов: server/messages_errors.py (ключи каноничны,
+# язык выбирается переменной окружения MENO_LANGUAGE: ru | en, fallback — en).
+# FastAPI отдаёт ошибки в каноническом envelope {"detail": <string>} —
+# HTTPException(status, texts.t(key)) сериализуется именно так; envelope не
+# менялся, чтобы не ломать существующих клиентов (Flet api_client.py).
+#
+# Полный openapi.json генерируется самим приложением: GET /openapi.json.
+# Этот файл — контрактная выдержка для документации/контракт-тестов.
+
+openapi: 3.0.3
+info:
+  title: MeNo Messenger API — Messages (post-refactor contract)
+  version: "2.0.0"
+  description: >
+    Локализованные ответы ошибок домена сообщений (рефакторинг god-route,
+    Пункт 1 архитектурного аудита). Язык ответа фиксируется на сервере через
+    MENO_LANGUAGE; переключение языка не является частью HTTP-контракта.
+
+servers:
+  - url: http://127.0.0.1:8000
+    description: Локальный запуск (docker-compose пробрасывает только на 127.0.0.1)
+
+tags:
+  - name: messages
+    description: Отправка, история, прочтение, удаление, жалобы.
+
+paths:
+  /api/chats/{chat_id}/messages:
+    post:
+      operationId: sendMessage
+      tags: [messages]
+      summary: Идемпотентная отправка сообщения в чат
+      description: >
+        Повтор с тем же client_id (8..64 символа) не создаёт дубликат.
+        WS/push-доставка выполняется строго после COMMIT транзакции БД.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ChatId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SendMessageRequest"
+      responses:
+        "200":
+          description: Сообщение принято (или возвращена ранее созданная запись при повторе client_id).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageResponse"
+        "400":
+          description: Пустое сообщение — content и media_path оба пусты.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                empty_ru:
+                  summary: ru (MENO_LANGUAGE=ru)
+                  value: { "detail": "Пустое сообщение" }
+                empty_en:
+                  summary: en
+                  value: { "detail": "Empty message" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: Отправитель не состоит в чате.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                not_member_ru:
+                  summary: ru
+                  value: { "detail": "Вы не участник этого чата" }
+                not_member_en:
+                  summary: en
+                  value: { "detail": "You are not a member of this chat" }
+        "429":
+          description: >
+            Скользящее окно антиспам-лимитера исчерпано
+            (cluster-safe Redis Lua; limit = SPAM_MSG_PER_MINUTE за 60 с).
+          headers:
+            Retry-After:
+              description: Рекомендуемая пауза перед следующей отправкой, секунд.
+              schema:
+                type: integer
+                example: 60
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                spam_ru:
+                  summary: ru
+                  value: { "detail": "Слишком часто отправляете сообщения" }
+                spam_en:
+                  summary: en
+                  value: { "detail": "You are sending messages too often" }
+
+  /api/messages/{message_id}/view:
+    post:
+      operationId: markMessageViewed
+      tags: [messages]
+      summary: Отметить прочтение; первый просмотр view-once запускает самоудаление
+      description: >
+        Гонка параллельных «прочитал» закрыта условным UPDATE...WHERE
+        (оптимистичная блокировка, server/db/concurrency.py): событие
+        message_delete публикует ровно один победитель перехода unseen->seen.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/MessageId"
+      responses:
+        "200":
+          description: Прочтение зафиксировано (идемпотентно для повторных вызовов).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OkResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: Сообщение существует, но запрашивающий не участник его чата.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                no_access_ru:
+                  summary: ru
+                  value: { "detail": "Нет доступа" }
+                no_access_en:
+                  summary: en
+                  value: { "detail": "Access denied" }
+        "404":
+          $ref: "#/components/responses/MessageNotFound"
+
+  /api/messages/{message_id}:
+    delete:
+      operationId: deleteOwnMessage
+      tags: [messages]
+      summary: Удаление собственного сообщения
+      description: >
+        Атомарный условный DELETE по владельцу в WHERE. Если строка исчезла
+        между SELECT и DELETE (параллельное удаление или janitor TTL-волна),
+        возвращается 404; если владелец другой — 403. Коды различаются
+        постфактум-перечитением, а не предварительной проверкой — гонки нет.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/MessageId"
+      responses:
+        "200":
+          description: Сообщение удалено, событие message_delete разослано участникам.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OkResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: Попытка удалить чужое сообщение.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                foreign_ru:
+                  summary: ru
+                  value: { "detail": "Удалять можно только свои сообщения" }
+                foreign_en:
+                  summary: en
+                  value: { "detail": "You can delete only your own messages" }
+        "404":
+          $ref: "#/components/responses/MessageNotFound"
+
+  /api/reports:
+    post:
+      operationId: reportMessage
+      tags: [messages]
+      summary: Жалоба модератору (только чужие сообщения, без дублей)
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ReportRequest"
+      responses:
+        "200":
+          description: Жалоба принята.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReportAcceptedResponse"
+              examples:
+                sent_ru:
+                  summary: ru
+                  value: { "ok": true, "message": "Жалоба отправлена модератору" }
+                sent_en:
+                  summary: en
+                  value: { "ok": true, "message": "Report sent to moderator" }
+        "400":
+          description: Жалоба на собственное сообщение либо дубликат открытой жалобы.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                self_ru:
+                  summary: ru — жалоба на своё сообщение
+                  value: { "detail": "Нельзя пожаловаться на своё сообщение" }
+                dup_ru:
+                  summary: ru — уже жаловались
+                  value: { "detail": "Вы уже пожаловались на это сообщение" }
+                self_en:
+                  summary: en
+                  value: { "detail": "You cannot report your own message" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: Заявитель не участник чата сообщения.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                not_member_ru:
+                  value: { "detail": "Вы не участник этого чата" }
+                not_member_en:
+                  value: { "detail": "You are not a member of this chat" }
+        "404":
+          $ref: "#/components/responses/MessageNotFound"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Access-токен из POST /api/auth/login (ротация refresh-сессий).
+
+  parameters:
+    ChatId:
+      name: chat_id
+      in: path
+      required: true
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+    MessageId:
+      name: message_id
+      in: path
+      required: true
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+
+  responses:
+    Unauthorized:
+      description: Токен отсутствует, истёк или отозван (family-revocation).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example: { "detail": "Not authenticated" }
+    MessageNotFound:
+      description: >
+        Сообщение не найдено среди ЖИВЫХ строк: физически удалено автором,
+        дворником (TTL/view-once) или скрыто мягким удалением is_deleted.
+        Единый код 404 для всех трёх причин — отсутствие перечислимости
+        чужих удалённых сообщений (защита от side-channel утечки метаданных).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          examples:
+            nf_ru:
+              summary: ru
+              value: { "detail": "Сообщение не найдено" }
+            nf_en:
+              summary: en
+              value: { "detail": "Message not found" }
+
+  schemas:
+    ErrorResponse:
+      type: object
+      description: >
+        Канонический FastAPI error envelope. Поле detail всегда содержит
+        человекочитаемый текст с активного языка (server/messages_errors.py);
+        машинно-читаемый ключ ошибки в тело НЕ включён — он не нужен
+        текущим клиентам и раскрыл бы внутреннюю структуру домена.
+      required: [detail]
+      properties:
+        detail:
+          type: string
+          description: Локализованное сообщение об ошибке.
+          example: "Сообщение не найдено"
+
+    OkResponse:
+      type: object
+      required: [ok]
+      properties:
+        ok:
+          type: boolean
+          example: true
+
+    ReportAcceptedResponse:
+      allOf:
+        - $ref: "#/components/schemas/OkResponse"
+        - type: object
+          properties:
+            message:
+              type: string
+              description: Локализованное подтверждение принятия жалобы.
+              example: "Жалоба отправлена модератору"
+
+    SendMessageRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        type:
+          type: string
+          enum: [text, image, file, voice, emoji]
+          default: text
+        content:
+          type: string
+          maxLength: 4000
+          default: ""
+        media_path:
+          type: string
+          default: ""
+        duration:
+          type: integer
+          minimum: 0
+          default: 0
+          description: Длительность аудио в секундах.
+        ttl_seconds:
+          type: integer
+          minimum: 5
+          maximum: 604800
+          nullable: true
+          description: Время жизни; смерть по TTL выполняет janitor (TTL-реестр).
+        view_once:
+          type: boolean
+          default: false
+          description: Самоудаление после первого просмотра участником.
+        e2e:
+          type: boolean
+          default: false
+          description: Content — base64 ciphertext X25519+AES-GCM, сервер не читает.
+        client_id:
+          type: string
+          minLength: 8
+          maxLength: 64
+          nullable: true
+          description: Идемпотентный ключ клиента; повтор не создаёт дубликат.
+
+    MessageResponse:
+      type: object
+      description: Сериализованное сообщение (wire-формат одинаков для PG и SQLite; datetime нормализованы к ISO-8601 UTC).
+      required: [id, chat_id, sender_id, sender_name, type, content, viewed, e2e, created_at]
+      properties:
+        id: { type: integer, format: int64 }
+        chat_id: { type: integer, format: int64 }
+        sender_id: { type: integer, format: int64 }
+        sender_name: { type: string }
+        type: { type: string, enum: [text, image, file, voice, emoji] }
+        content: { type: string }
+        media_path: { type: string, nullable: true }
+        duration: { type: integer, default: 0 }
+        ttl_seconds: { type: integer, nullable: true }
+        view_once: { type: boolean }
+        viewed: { type: boolean }
+        e2e: { type: boolean }
+        client_id: { type: string, nullable: true }
+        expires_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Абсолютный момент физической смерти (таймер автоудаления на клиенте).
+        created_at:
+          type: string
+          format: date-time
+
+    MessagesListResponse:
+      type: object
+      required: [messages, has_more]
+      properties:
+        messages:
+          type: array
+          items:
+            $ref: "#/components/schemas/MessageResponse"
+        next_cursor:
+          type: integer
+          format: int64
+          nullable: true
+          description: Курсорная пагинация «назад в историю» (id последней строки).
+        has_more:
+          type: boolean
+
+    ReportRequest:
+      type: object
+      additionalProperties: false
+      required: [message_id]
+      properties:
+        message_id:
+          type: integer
+          format: int64
+          minimum: 1
+        reason:
+          type: string
+          maxLength: 500
+          default: ""

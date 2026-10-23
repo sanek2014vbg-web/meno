@@ -79,8 +79,16 @@ async def lifespan(app: FastAPI):
 
     await ws_manager.start_bus_listener()
 
+    # MeNo Admin Center & Monitor: слушатель админского перехват-тапа
+    # (канал Redis meno:admin:tap) — события с всех воркеров фан-аутятся
+    # SuperAdmin WS-сессиям. Идемпотентно; без Redis not-a-op.
+    from server.admin_tap import admin_tap
+
+    await admin_tap.start_bus_listener()
+
     yield
 
+    await admin_tap.stop_bus_listener()
     await ws_manager.stop_bus_listener()
     await janitor_service.stop()
     await cache.close()

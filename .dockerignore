@@ -1,0 +1,48 @@
+# MeNo Messenger — контекст сборки Docker (build context = корень репозитория,
+# dockerfile: server/Dockerfile). Всё, что перечислено ниже, НЕ попадает в
+# образ: меньше поверхность атаки (секреты), быстрее сборка, чище слои.
+
+# --- Секреты и локальная конфигурация (OWASP A05: Security Misconfiguration) ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+server/server.log
+logs/
+
+# --- Тесты, CI, инструменты разработки (не нужны в runtime-образе) ---
+tests/
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.ruff_cache/
+.pre-commit-config.yaml
+.github/
+.vscode/
+.idea/
+client/
+docs/
+README.md
+CONTRIBUTING.md
+CHANGELOG.md
+
+# --- Python-артефакты (пересоздаются; PYTHONDONTWRITEBYTECODE=1) ---
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.egg-info/
+.venv/
+venv/
+
+# --- git ---
+.git/
+.gitignore
+.gitattributes
+
+# --- локальные данные разработчика ---
+uploads/
+server/uploads/
+*.sqlite3
+*.db

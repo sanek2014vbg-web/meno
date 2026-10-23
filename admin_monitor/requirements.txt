@@ -1,0 +1,9 @@
+# MeNo Admin Center & Monitor — зависимости Windows-клиента (Python 3.12).
+PyQt6>=6.6.0
+qasync>=0.27.0
+httpx>=0.27.0
+websockets>=12.0
+# Native Windows Toast (опционально; без них — fallback на balloon трея):
+win1toast>=0.35 ; sys_platform == "win32"
+winotify>=1.1 ; sys_platform == "win32"
+# Экспорт .exe: pyinstaller admin_monitor/main.py --onefile --windowed --name MeNoMonitor
