@@ -39,6 +39,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import socket
 from datetime import timedelta
 from typing import Dict, List, Optional
 
@@ -47,6 +49,7 @@ from sqlalchemy import text as sql_text
 from server import database
 from server.cache import cache
 from server.deps import chat_member_ids
+from server.services import ttl_registry
 from server.utils import as_utc, utc_now
 from server.ws_manager import manager
 
@@ -54,6 +57,19 @@ log = logging.getLogger("meno.janitor")
 
 # Кэш результата проверки схемы на процесс (схема меняется только с миграцией).
 _SCHEMA_EXPIRES_AT: Optional[bool] = None
+
+
+# --- Registry-волна (Пункт 5 аудита) ------------------------------------------
+# Каждые N тиков основной цикл выполняет проход по реестру janitor_jobs.
+# Интервал джоб (interval_seconds) фильтрует «due» внутри прохода, поэтому
+# частота именно registry-скана — лишь верхняя граница задержки.
+REGISTRY_EVERY_TICKS = 6
+REGISTRY_DELETE_LIMIT = 2000
+
+
+def _worker_id() -> str:
+    """Идентификатор воркера для observability advisory-лока (pid@hostname)."""
+    return f"{socket.gethostname()}:{os.getpid()}"[:64]
 
 
 def _probe_sync(sync_conn) -> bool:
@@ -131,11 +147,84 @@ class JanitorService:
             await asyncio.sleep(interval)
 
     # ------------------------------------------------------------------ #
+    # Registry-волна (Пункт 5 аудита): TTL-джобы из реестра janitor_jobs
+    # ------------------------------------------------------------------ #
+
+    async def run_registry_wave(self) -> Dict[str, int]:
+        """Один проход по реестру janitor_jobs: due-джобы под advisory-локом.
+
+        Идемпотентность и кластерная безопасность: захват джобы — атомарный
+        UPDATE idle->running (server/db/concurrency.conditional_update),
+        поэтому на SQLite без SELECT FOR UPDATE второй воркер получает
+        rowcount==0 и пропускает волну. Каждая джоба выполняется в СВОЁМ
+        get_db-контексте: сбой/блокировка одной таблицы очистки не откатывает
+        прогресс остальных. Возвращает {job: удалено_строк}.
+        """
+        results: Dict[str, int] = {}
+        owner = _worker_id()
+        now = utc_now()
+
+        async with database.get_db() as db:
+            await ttl_registry.ensure_registered(db)
+            due = await ttl_registry.load_due_jobs(db, now)
+
+        for job in due:
+            async with database.get_db() as db:
+                if not await ttl_registry.claim_job(db, job, owner):
+                    continue  # лок у другого воркера/тикинущей волны
+                crashed = False
+                deleted = 0
+                try:
+                    deleted = await ttl_registry.delete_expired_rows(
+                        db, job, now, REGISTRY_DELETE_LIMIT
+                    )
+                except Exception as exc:  # noqa: BLE001 — волна джобы не роняет цикл
+                    crashed = True
+                    log.error(
+                        "Janitor registry job %s failed: %s: %s",
+                        job.job,
+                        exc.__class__.__name__,
+                        exc,
+                    )
+                await ttl_registry.finish_job(db, job, deleted, crashed=crashed)
+            results[job.job] = deleted
+            from server.routes_admin import broadcast_tap
+
+            await broadcast_tap(
+                {
+                    "scope": "janitor",
+                    "kind": "registry_wave_job",
+                    "job": job.job,
+                    "table": job.table_name,
+                    "rows_deleted": deleted,
+                    "crashed": crashed,
+                    "worker": owner,
+                }
+            )
+        return results
+
+    # ------------------------------------------------------------------ #
     # Один тик: найти -> удалить -> почистить Redis -> разослать событие
     # ------------------------------------------------------------------ #
 
     async def run_once(self) -> int:
-        """Выполняет одну волну очистки. Возвращает число удалённых сообщений."""
+        """Выполняет одну волну очистки. Возвращает число удалённых сообщений.
+
+        Каждые REGISTRY_EVERY_TICKS тиков дополнительно прогоняется
+        registry-волна (Пункт 5 аудита): TTL-джобы из janitor_jobs под
+        advisory-локом. Её сбои изолированы — основной цикл стирания
+        сообщений выполняется независимо и всегда.
+        """
+        self._tick_count += 1
+        if self._tick_count % REGISTRY_EVERY_TICKS == 0:
+            try:
+                await self.run_registry_wave()
+            except Exception as exc:  # noqa: BLE001 — реестр не роняет основной тик
+                log.error(
+                    "Janitor registry wave failed: %s: %s",
+                    exc.__class__.__name__,
+                    exc,
+                )
         now = utc_now()
         expired: List[Dict] = []
 
@@ -180,7 +269,6 @@ class JanitorService:
             )
 
             if not expired:
-                self._tick_count += 1
                 return 0
 
             ids = [row["id"] for row in expired]
@@ -217,11 +305,21 @@ class JanitorService:
             # send_to_user сам выбирает маршрут: Redis Pub/Sub (все воркеры)
             # либо локальная доставка (single worker / без Redis).
             await manager.send_to_users(member_ids, payload)
+            from server.routes_admin import broadcast_tap
+
+            await broadcast_tap(
+                {
+                    "scope": "janitor",
+                    "kind": "ttl_erase",
+                    "chat_id": chat_id,
+                    "message_ids": msg_ids,
+                    "worker": _worker_id(),
+                }
+            )
 
         log.info(
             "Janitor erased %s message(s) across %s chat(s)", len(ids), len(by_chat)
         )
-        self._tick_count += 1
         return len(ids)
 
 
@@ -232,4 +330,6 @@ __all__ = [
     "janitor_service",
     "JANITOR_INTERVAL_SECONDS",
     "DELETE_EVENT_TYPE",
+    "REGISTRY_EVERY_TICKS",
+    "REGISTRY_DELETE_LIMIT",
 ]

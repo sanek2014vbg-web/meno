@@ -1,0 +1,7 @@
+2026-10-23 16:05:49 | WARNING | server.rate_limit:allow_async:75 | Redis rate limiter unavailable (NoScriptError), local fallback
+2026-10-23 16:17:16 | WARNING | server.rate_limit:allow_async:75 | Redis rate limiter unavailable (NoScriptError), local fallback
+2026-10-23 16:22:02 | WARNING | server.rate_limit:allow_async:75 | Redis rate limiter unavailable (NoScriptError), local fallback
+2026-10-23 16:36:54 | WARNING | server.rate_limit:allow_async:75 | Redis rate limiter unavailable (NoScriptError), local fallback
+2026-10-23 18:18:57 | WARNING | server.rate_limit:allow_async:75 | Redis rate limiter unavailable (NoScriptError), local fallback
+2026-10-23 18:19:25 | WARNING | server.rate_limit:allow_async:75 | Redis rate limiter unavailable (NoScriptError), local fallback
+2026-10-23 18:20:03 | WARNING | server.rate_limit:allow_async:75 | Redis rate limiter unavailable (NoScriptError), local fallback

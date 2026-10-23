@@ -20,7 +20,9 @@ from server.db.connection import AsyncSessionLocal, engine
 from server.db.models_base import (
     Base,
     Chat,
+    ChatInvite,
     ChatMember,
+    JanitorJob,
     Message,
     PushOutbox,
     PushToken,
@@ -29,6 +31,7 @@ from server.db.models_base import (
     Report,
     SecurityEvent,
     Setting,
+    ComplianceAuditLog,
     User,
     VerifyCode,
 )
@@ -48,7 +51,9 @@ __all__ = [
     "DATABASE_URL",
     "IS_SQLITE",
     "Chat",
+    "ChatInvite",
     "ChatMember",
+    "JanitorJob",
     "Message",
     "PushOutbox",
     "PushToken",

@@ -105,6 +105,11 @@ async def clean_db():
         else:
             kwargs["connect_args"] = _sqlite_connect_args()
         database.engine = create_async_engine(database.DATABASE_URL, **kwargs)
+        # Порядок важен: сначала навешиваем PRAGMA-хук (busy_timeout=30000 + WAL
+        # на КАЖДОМ новом соединении, server/db/connection._sqlite_pragmas), и
+        # только потом открываем пул. Иначе первое соединение пула создаётся без
+        # слушателя с дефолтным busy_timeout=0 — параллельные async-сессии WS-тестов
+        # падают с 'database is locked' ещё до включения глобального WAL.
         attach_sqlite_listeners(database.engine.sync_engine)
         database.AsyncSessionLocal.configure(bind=database.engine)
 

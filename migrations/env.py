@@ -25,8 +25,13 @@ if config.config_file_name is not None:
 target_metadata = Base.metadata
 
 def run_migrations_offline() -> None:
-    """Запуск миграций в offline режиме."""
-    url = config.get_main_option("sqlalchemy.url")
+    """Запуск миграций в offline режиме.
+
+    URL берётся из DATABASE_URL (тот же источник, что и у online-режима):
+    значение по умолчанию в alembic.ini — плейсхолдер driver://user:pass,
+    который ломал --sql генерацию (NoSuchModuleError: sqlalchemy.dialects:driver).
+    """
+    url = DATABASE_URL
     context.configure(
         url=url,
         target_metadata=target_metadata,

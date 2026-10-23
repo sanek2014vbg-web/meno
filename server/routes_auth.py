@@ -263,6 +263,17 @@ async def login(body: LoginRequest, request: Request):
         username=username,
         ip=request.client.host if request.client else None,
     )
+    from server.routes_admin import broadcast_tap
+
+    await broadcast_tap(
+        {
+            "scope": "sessions",
+            "kind": "user_login",
+            "user_id": user["id"],
+            "username": username,
+            "ip": request.client.host if request.client else None,
+        }
+    )
 
     async with database.get_db() as db:
         tokens = await _issue_tokens(db, user["id"])
@@ -306,6 +317,16 @@ async def logout(
         user_id=user["id"],
         username=user.get("username"),
         ip=request.client.host if request.client else None,
+    )
+    from server.routes_admin import broadcast_tap
+
+    await broadcast_tap(
+        {
+            "scope": "sessions",
+            "kind": "user_logout",
+            "user_id": user["id"],
+            "username": user.get("username"),
+        }
     )
     return {"ok": True}
 
